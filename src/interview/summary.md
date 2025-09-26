@@ -110,12 +110,43 @@ CAS 是一种 原子操作，用于多线程/多 goroutine 下安全地修改共
 3. 第一个线程执行 CAS 时，看到的仍然是 A，认为没有变化，于是 CAS 成功。
 
 ## Slice
-在老的版本中，
+### go1.18之前
+1. 如果期望容量大于旧的容量的两倍，直接用期望容量
+2. 如果旧容量小于1024，直接翻倍
+3. 否则，每次增长1.25倍，知道足够。
+```go
+func growslice(et *_type, old slice, cap int) slice {
+    ...
 
-新版本中
+	newcap := old.cap
+	doublecap := newcap + newcap
+	if cap > doublecap {
+		newcap = cap
+	} else {
+		if old.cap < 1024 {
+			newcap = doublecap
+		} else {
+			// Check 0 < newcap to detect overflow
+			// and prevent an infinite loop.
+			for 0 < newcap && newcap < cap {
+				newcap += newcap / 4
+			}
+			// Set newcap to the requested cap when
+			// the newcap calculation overflowed.
+			if newcap <= 0 {
+				newcap = cap
+			}
+		}
+	}
+
+	...
+}
+```
+
+### go1.18之后
 1. `newLen`>`2*oldCap`，返回`newLen`
 2. `oldCap`>threshold=256，返回 `2 * oldCap`
-3. 在当前`cap`基础上循环累加`(cap + 3*256)>>2`，直到满足`newLen`
+3. 在当前`cap`基础上循环累加`(cap + 3*256)>>2`，直到满足`newLen`。更加平滑了。
 ```go
 func growslice(oldPtr unsafe.Pointer, newLen, oldCap, num int, et *_type) slice {
     ...

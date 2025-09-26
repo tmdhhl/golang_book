@@ -2,7 +2,48 @@
 
 ## make slice
 ```golang
+func growslice(et *_type, old slice, cap int) slice {
+	if raceenabled {
+		callerpc := getcallerpc()
+		racereadrangepc(old.array, uintptr(old.len*int(et.size)), callerpc, funcPC(growslice))
+	}
+	if msanenabled {
+		msanread(old.array, uintptr(old.len*int(et.size)))
+	}
 
+	if cap < old.cap {
+		panic(errorString("growslice: cap out of range"))
+	}
+
+	if et.size == 0 {
+		// append should not create a slice with nil pointer but non-zero len.
+		// We assume that append doesn't need to preserve old.array in this case.
+		return slice{unsafe.Pointer(&zerobase), old.len, cap}
+	}
+
+	newcap := old.cap
+	doublecap := newcap + newcap
+	if cap > doublecap {
+		newcap = cap
+	} else {
+		if old.cap < 1024 {
+			newcap = doublecap
+		} else {
+			// Check 0 < newcap to detect overflow
+			// and prevent an infinite loop.
+			for 0 < newcap && newcap < cap {
+				newcap += newcap / 4
+			}
+			// Set newcap to the requested cap when
+			// the newcap calculation overflowed.
+			if newcap <= 0 {
+				newcap = cap
+			}
+		}
+	}
+
+	...
+}
 ```
 ## append
 源码位置：`/usr/local/go/src/runtime/slice.go`
