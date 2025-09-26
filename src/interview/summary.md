@@ -514,7 +514,316 @@ func evacuate(t *maptype, h *hmap, oldbucket uintptr) {
 - [Go 1.24用户报告：Datadog如何借助 Swiss Tables版map节省数百 GB 内存？](https://tonybai.com/2025/07/22/go-swiss-table-map-user-report/)
 - [Map internals in Go 1.24](https://themsaid.com/map-internals-go-1-24?utm_source=chatgpt.com)
 ## Channel
+`channel`使用 `mutex` 来保障并发安全。 无缓冲的channel是同步的，而有缓冲的channel是非同步的 
 
+对于有缓冲的`channel` 内部是一个循环数组，如果队列满了，新的sender被放入 `sendq`, 如果队列空了，receiver 被放到 `recvq` 中。
+- 元素无指针：`hchan` + `buf` 一起分配
+- 元素有指针：`hchan` 与 `buf` 分开分配，让 GC 能扫描元素。
+对于无缓冲的 `channel` 之分配 `hchan`，不分配 `buf`。
+
+**常见情况**:
+- panic场景：
+	- 关闭一个一关闭的channel
+	- 关闭一个nil的channel
+	- send to nil channel
+- 死锁：
+	- read from nil channel
+- 阻塞场景：
+
+- 怎么传递：Go channel 尽量保证 FIFO，但 在高并发和缓冲区满 + 等待接收者的情况下，严格 FIFO 不一定成立。
+	- 如果 `recvq` 不为空，直接从 sender 给 receiver，绕过缓冲区。
+	- 其他情况先放到缓冲区，然后`receiver`再取走
+
+```go
+type hchan struct {
+	qcount   uint           // total data in the queue
+	dataqsiz uint           // size of the circular queue
+	buf      unsafe.Pointer // points to an array of dataqsiz elements
+	elemsize uint16
+	closed   uint32
+	timer    *timer // timer feeding this chan
+	elemtype *_type // element type
+	sendx    uint   // send index
+	recvx    uint   // receive index
+	recvq    waitq  // list of recv waiters
+	sendq    waitq  // list of send waiters
+	bubble   *synctestBubble
+
+	// lock protects all fields in hchan, as well as several
+	// fields in sudogs blocked on this channel.
+	//
+	// Do not change another G's status while holding this lock
+	// (in particular, do not ready a G), as this can deadlock
+	// with stack shrinking.
+	lock mutex
+}
+
+type waitq struct {
+	first *sudog
+	last  *sudog
+}
+
+type sudog struct {
+	// The following fields are protected by the hchan.lock of the
+	// channel this sudog is blocking on. shrinkstack depends on
+	// this for sudogs involved in channel ops.
+
+	g *g
+
+	next *sudog
+	prev *sudog
+	elem unsafe.Pointer // data element (may point to stack)
+
+	// The following fields are never accessed concurrently.
+	// For channels, waitlink is only accessed by g.
+	// For semaphores, all fields (including the ones above)
+	// are only accessed when holding a semaRoot lock.
+
+	acquiretime int64
+	releasetime int64
+	ticket      uint32
+
+	// isSelect indicates g is participating in a select, so
+	// g.selectDone must be CAS'd to win the wake-up race.
+	isSelect bool
+
+	// success indicates whether communication over channel c
+	// succeeded. It is true if the goroutine was awoken because a
+	// value was delivered over channel c, and false if awoken
+	// because c was closed.
+	success bool
+
+	// waiters is a count of semaRoot waiting list other than head of list,
+	// clamped to a uint16 to fit in unused space.
+	// Only meaningful at the head of the list.
+	// (If we wanted to be overly clever, we could store a high 16 bits
+	// in the second entry in the list.)
+	waiters uint16
+
+	parent   *sudog // semaRoot binary tree
+	waitlink *sudog // g.waiting list or semaRoot
+	waittail *sudog // semaRoot
+	c        *hchan // channel
+}
+```
+
+### 初始化channel
+```go
+func makechan(t *chantype, size int) *hchan {
+	elem := t.Elem
+
+	// compiler checks this but be safe.
+	if elem.Size_ >= 1<<16 {
+		throw("makechan: invalid channel element type")
+	}
+	if hchanSize%maxAlign != 0 || elem.Align_ > maxAlign {
+		throw("makechan: bad alignment")
+	}
+
+	mem, overflow := math.MulUintptr(elem.Size_, uintptr(size))
+	if overflow || mem > maxAlloc-hchanSize || size < 0 {
+		panic(plainError("makechan: size out of range"))
+	}
+
+	// Hchan does not contain pointers interesting for GC when elements stored in buf do not contain pointers.
+	// buf points into the same allocation, elemtype is persistent.
+	// SudoG's are referenced from their owning thread so they can't be collected.
+	// TODO(dvyukov,rlh): Rethink when collector can move allocated objects.
+	var c *hchan
+	switch {
+	case mem == 0:
+		// Queue or element size is zero.
+		c = (*hchan)(mallocgc(hchanSize, nil, true))
+		// Race detector uses this location for synchronization.
+		c.buf = c.raceaddr()
+	case !elem.Pointers():
+		// Elements do not contain pointers.
+		// Allocate hchan and buf in one call.
+		c = (*hchan)(mallocgc(hchanSize+mem, nil, true))
+		c.buf = add(unsafe.Pointer(c), hchanSize)
+	default:
+		// Elements contain pointers.
+		c = new(hchan)
+		c.buf = mallocgc(mem, elem, true)
+	}
+
+	c.elemsize = uint16(elem.Size_)
+	c.elemtype = elem
+	c.dataqsiz = uint(size)
+	if b := getg().bubble; b != nil {
+		c.bubble = b
+	}
+	lockInit(&c.lock, lockRankHchan)
+
+	if debugChan {
+		print("makechan: chan=", c, "; elemsize=", elem.Size_, "; dataqsiz=", size, "\n")
+	}
+	return c
+}
+```
+
+### chansend
+sender 阻塞时会被包装成`sudog`，然后入队，并把当前`goroutine`挂起。
+
+挂起期间确保要发送的值在接收方复制它之前保持存活。sudog 有一个指向栈对象的指针，但 sudog 并不被栈扫描器视作 GC 根对象。
+```go
+func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
+	if c == nil {
+		if !block {
+			return false
+		}
+		gopark(nil, nil, waitReasonChanSendNilChan, traceBlockForever, 2)
+		throw("unreachable")
+	}
+
+	if debugChan {
+		print("chansend: chan=", c, "\n")
+	}
+
+	if raceenabled {
+		racereadpc(c.raceaddr(), callerpc, abi.FuncPCABIInternal(chansend))
+	}
+
+	if c.bubble != nil && getg().bubble != c.bubble {
+		fatal("send on synctest channel from outside bubble")
+	}
+
+	// Fast path: check for failed non-blocking operation without acquiring the lock.
+	//
+	// After observing that the channel is not closed, we observe that the channel is
+	// not ready for sending. Each of these observations is a single word-sized read
+	// (first c.closed and second full()).
+	// Because a closed channel cannot transition from 'ready for sending' to
+	// 'not ready for sending', even if the channel is closed between the two observations,
+	// they imply a moment between the two when the channel was both not yet closed
+	// and not ready for sending. We behave as if we observed the channel at that moment,
+	// and report that the send cannot proceed.
+	//
+	// It is okay if the reads are reordered here: if we observe that the channel is not
+	// ready for sending and then observe that it is not closed, that implies that the
+	// channel wasn't closed during the first observation. However, nothing here
+	// guarantees forward progress. We rely on the side effects of lock release in
+	// chanrecv() and closechan() to update this thread's view of c.closed and full().
+	if !block && c.closed == 0 && full(c) {
+		return false
+	}
+
+	var t0 int64
+	if blockprofilerate > 0 {
+		t0 = cputicks()
+	}
+
+	lock(&c.lock)
+
+	if c.closed != 0 {
+		unlock(&c.lock)
+		panic(plainError("send on closed channel"))
+	}
+
+	// recvq 不为空，直接给 receiver，绕过缓冲区
+	if sg := c.recvq.dequeue(); sg != nil {
+		// Found a waiting receiver. We pass the value we want to send
+		// directly to the receiver, bypassing the channel buffer (if any).
+		send(c, sg, ep, func() { unlock(&c.lock) }, 3)
+		return true
+	}
+
+	// 队列未满，入队
+	if c.qcount < c.dataqsiz {
+		// Space is available in the channel buffer. Enqueue the element to send.
+		qp := chanbuf(c, c.sendx)
+		if raceenabled {
+			racenotify(c, c.sendx, nil)
+		}
+		typedmemmove(c.elemtype, qp, ep)
+		c.sendx++
+		if c.sendx == c.dataqsiz {
+			c.sendx = 0
+		}
+		c.qcount++
+		unlock(&c.lock)
+		return true
+	}
+
+	// 如果这是非阻塞发送 (select 或者 default)，直接返回失败。
+	// 否则，需要阻塞等待
+	if !block {
+		unlock(&c.lock)
+		return false
+	}
+
+	// Block on the channel. Some receiver will complete our operation for us.
+	// 获取当前 Goroutine
+	gp := getg() 
+	// 获取一个 sudog（可能从空闲池拿）
+	mysg := acquireSudog()
+	mysg.releasetime = 0
+	if t0 != 0 {
+		mysg.releasetime = -1
+	}
+	// No stack splits between assigning elem and enqueuing mysg
+	// on gp.waiting where copystack can find it.
+	// 要发送的元素地址
+	mysg.elem = ep 
+	mysg.waitlink = nil
+	// 挂起的 Goroutine
+	mysg.g = gp
+	// 标记不是 select 阻塞
+	mysg.isSelect = false
+	// channel
+	mysg.c = c
+	// 把当前 Goroutine 和阻塞的 channel 发送操作绑定
+	gp.waiting = mysg
+	// 清空 Goroutine 的参数字段，避免干扰后续操作。
+	gp.param = nil
+	// 将 sudog 加入 channel 的 发送队列，等待消费。
+	c.sendq.enqueue(mysg)
+	// Signal to anyone trying to shrink our stack that we're about
+	// to park on a channel. The window between when this G's status
+	// changes and when we set gp.activeStackChans is not safe for
+	// stack shrinking.
+
+	// Goroutine 要在 channel 阻塞时，需要在 runtime 通知栈管理器之前把状态设置好。
+	// gp.activeStackChans 是一个信号，告诉 runtime “我的栈正用于 channel 阻塞，不要收缩”。
+	// 这样可以避免阻塞期间的栈破坏。
+	gp.parkingOnChan.Store(true)
+	reason := waitReasonChanSend
+	if c.bubble != nil {
+		reason = waitReasonSynctestChanSend
+	}
+	// 让当前 goroutine 挂起，等待被接受者唤醒。
+	gopark(chanparkcommit, unsafe.Pointer(&c.lock), reason, traceBlockChanSend, 2)
+	// Ensure the value being sent is kept alive until the
+	// receiver copies it out. The sudog has a pointer to the
+	// stack object, but sudogs aren't considered as roots of the
+	// stack tracer.
+
+	// sudog虽然有指针，但是不会被当作 GC Root，防止被 Gc 回收栈
+	KeepAlive(ep)
+
+	// someone woke us up.
+	if mysg != gp.waiting {
+		throw("G waiting list is corrupted")
+	}
+	gp.waiting = nil
+	gp.activeStackChans = false
+	closed := !mysg.success
+	gp.param = nil
+	if mysg.releasetime > 0 {
+		blockevent(mysg.releasetime-t0, 2)
+	}
+	mysg.c = nil
+	// 清理 sudog
+	releaseSudog(mysg)
+	if closed {
+		if c.closed == 0 {
+			throw("chansend: spurious wakeup")
+		}
+		panic(plainError("send on closed channel"))
+	}
+	return true
+}
+```
 ## Context
 
 ## Sync
