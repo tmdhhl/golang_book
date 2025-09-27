@@ -1257,6 +1257,8 @@ func closechan(c *hchan) {
 
 ## sync
 ### sync.Map
+`read` 和 `dirty` 冗余，实现读写分离。
+
 读多写少场景下，`sync.Map`比`sync.Mutex + map`性能更好。
 
 读少写多场景下，应更减少锁的粒度，`sync.Map`不适合该场景。
