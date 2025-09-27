@@ -1,7 +1,9 @@
 ## scheduler
+<!-- toc -->
 
 Reference:
 - [Go scheduler](https://nghiant3223.github.io/2025/04/15/go-scheduler.html)
+- [Golang GMP 模型深度解析](https://blog.csdn.net/qq_44805265/article/details/152161116?spm=1001.2014.3001.5502)
 
 ## 内存分配
 
@@ -58,9 +60,10 @@ Goroutine 一起竞争锁的所有权。新来的 Goroutine 有优势，
 ### 指令重排
 为了提高cpu指令吞吐
 
-#### 内存屏障：用来解决执行重排带来的部分不利影响。用来阻止屏障前后的指令共同参与重排序，保证屏障后的指令不会出现在屏障前执行，保证屏障前的指令不会在屏障后执行。相当于屏障之前和之后确立了happens-before关系，保证了屏障之前的操作对屏障之后的操作都是可见的。
+#### 内存屏障
+用来解决执行重排带来的部分不利影响。用来阻止屏障前后的指令共同参与重排序，保证屏障后的指令不会出现在屏障前执行，保证屏障前的指令不会在屏障后执行。相当于屏障之前和之后确立了happens-before关系，保证了屏障之前的操作对屏障之后的操作都是可见的。
 
-#### happens-before：
+#### happens-before
 Happens-before (HB) 是并发编程里的一个核心概念，用来描述 操作之间的可见性和顺序关系。
 
 **定义**：
@@ -523,12 +526,14 @@ func evacuate(t *maptype, h *hmap, oldbucket uintptr) {
 
 **常见情况**:
 - panic场景：
-	- 关闭一个一关闭的channel
+	- 关闭一个已关闭的channel
+	- 向关闭的 chan 发送数据也会 panic
 	- 关闭一个nil的channel
-	- send to nil channel
-- 死锁：
-	- read from nil channel
 - 阻塞场景：
+	- send to nil channel
+	- read from nil channel
+	- 接收时，buffer为空且 sendq 为空
+	- 发送时，buffer满了且 recvq 为空
 
 - 怎么传递：Go channel 尽量保证 FIFO，但 在高并发和缓冲区满 + 等待接收者的情况下，严格 FIFO 不一定成立。
 	- 如果 `recvq` 不为空，直接从 sender 给 receiver，绕过缓冲区。
@@ -668,6 +673,8 @@ sender 阻塞时会被包装成`sudog`，然后入队，并把当前`goroutine`�
 挂起期间确保要发送的值在接收方复制它之前保持存活。sudog 有一个指向栈对象的指针，但 sudog 并不被栈扫描器视作 GC 根对象。
 ```go
 func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
+	// 如果 chan 为 nil，且是非阻塞的就直接返回
+	// 否则 gopark 阻塞
 	if c == nil {
 		if !block {
 			return false
@@ -713,8 +720,10 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		t0 = cputicks()
 	}
 
+	// 加锁
 	lock(&c.lock)
 
+	// 向已关闭的 chan 发送数据，会 panic。
 	if c.closed != 0 {
 		unlock(&c.lock)
 		panic(plainError("send on closed channel"))
@@ -819,14 +828,600 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		if c.closed == 0 {
 			throw("chansend: spurious wakeup")
 		}
+		// 向关闭的 chan 发送数据也会 panic
 		panic(plainError("send on closed channel"))
 	}
 	return true
 }
 ```
+
+### chanrecv
+1. fast path（无需加锁）：对非阻塞接收来说，如果 channel 空且未关闭直接返回；如果空且已关闭，清理接收变量并返回“完成但未接收到数据”。
+2. 加锁后操作
+- 如果 channel 已经关闭且没有数据了，就解锁并返回
+- 如果 channel 关闭了，但是还有数据，从 sendq 出队一个 sender：sg
+	- 如果 buffer 为空，直接从 sg 接收数据
+	- 否则从缓冲队列队首的 sender 接收数据，并把 sg 添加到缓冲队列
+- buffer 和 sendq 都没有找到 sender，阻塞当前 receiver
+```go
+func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool) {
+	// raceenabled: don't need to check ep, as it is always on the stack
+	// or is new memory allocated by reflect.
+
+	if debugChan {
+		print("chanrecv: chan=", c, "\n")
+	}
+
+	// 如果 chan 为 nil，且非阻塞操作的直接返回
+	// 否则阻塞
+	if c == nil {
+		if !block {
+			return
+		}
+		gopark(nil, nil, waitReasonChanReceiveNilChan, traceBlockForever, 2)
+		throw("unreachable")
+	}
+
+	if c.bubble != nil && getg().bubble != c.bubble {
+		fatal("receive on synctest channel from outside bubble")
+	}
+
+	if c.timer != nil {
+		c.timer.maybeRunChan(c)
+	}
+
+	// Fast path: check for failed non-blocking operation without acquiring the lock.
+	// 快速路径：在不获取锁的情况检查非阻塞操作是否会失败
+	// 如果是非阻塞操作 且 channel 为空，进入快速路径
+	if !block && empty(c) {
+		// After observing that the channel is not ready for receiving, we observe whether the
+		// channel is closed.
+		//
+		// Reordering of these checks could lead to incorrect behavior when racing with a close.
+		// For example, if the channel was open and not empty, was closed, and then drained,
+		// reordered reads could incorrectly indicate "open and empty". To prevent reordering,
+		// we use atomic loads for both checks, and rely on emptying and closing to happen in
+		// separate critical sections under the same lock.  This assumption fails when closing
+		// an unbuffered channel with a blocked send, but that is an error condition anyway.
+
+		// 如果 channel 没有关闭，直接返回
+		// 原子操作，
+		if atomic.Load(&c.closed) == 0 {
+			// Because a channel cannot be reopened, the later observation of the channel
+			// being not closed implies that it was also not closed at the moment of the
+			// first observation. We behave as if we observed the channel at that moment
+			// and report that the receive cannot proceed.
+			return
+		}
+		// The channel is irreversibly closed. Re-check whether the channel has any pending data
+		// to receive, which could have arrived between the empty and closed checks above.
+		// Sequential consistency is also required here, when racing with such a send.
+		// 重新检查 channel 是否为空，仍为空直接返回
+		// 因为数据可能在上面 empty 检查和 closed 检查之间到达。
+		if empty(c) {
+			// The channel is irreversibly closed and empty.
+			if raceenabled {
+				raceacquire(c.raceaddr())
+			}
+			if ep != nil {
+				typedmemclr(c.elemtype, ep)
+			}
+			return true, false
+		}
+	}
+
+	var t0 int64
+	if blockprofilerate > 0 {
+		t0 = cputicks()
+	}
+
+	// 加锁
+	lock(&c.lock)
+
+	// 如果 channel 已经关闭且没有数据了，就解锁并返回
+	// 如果 channel 关闭了，但是还有数据，从 sendq 出队一个 sender：sg
+	// 	- 如果 buffer 为空，直接从 sg 接收数据
+	//  - 否则从缓冲队列队首的 sender 接收数据，并把 sg 添加到缓冲队列
+	if c.closed != 0 {
+		if c.qcount == 0 {
+			if raceenabled {
+				raceacquire(c.raceaddr())
+			}
+			unlock(&c.lock)
+			if ep != nil {
+				typedmemclr(c.elemtype, ep)
+			}
+			return true, false
+		}
+		// The channel has been closed, but the channel's buffer have data.
+	} else {
+		// Just found waiting sender with not closed.
+		if sg := c.sendq.dequeue(); sg != nil {
+			// Found a waiting sender. If buffer is size 0, receive value
+			// directly from sender. Otherwise, receive from head of queue
+			// and add sender's value to the tail of the queue (both map to
+			// the same buffer slot because the queue is full).
+			recv(c, sg, ep, func() { unlock(&c.lock) }, 3)
+			return true, true
+		}
+	}
+
+	if c.qcount > 0 {
+		// Receive directly from queue
+		qp := chanbuf(c, c.recvx)
+		if raceenabled {
+			racenotify(c, c.recvx, nil)
+		}
+		if ep != nil {
+			typedmemmove(c.elemtype, ep, qp)
+		}
+		typedmemclr(c.elemtype, qp)
+		c.recvx++
+		if c.recvx == c.dataqsiz {
+			c.recvx = 0
+		}
+		c.qcount--
+		unlock(&c.lock)
+		return true, true
+	}
+
+	// 如果是非阻塞操作，返回
+	if !block {
+		unlock(&c.lock)
+		return false, false
+	}
+
+	// no sender available: block on this channel.
+	// 没有 sender，需要阻塞当前 receiver
+	gp := getg()
+	mysg := acquireSudog()
+	mysg.releasetime = 0
+	if t0 != 0 {
+		mysg.releasetime = -1
+	}
+	// No stack splits between assigning elem and enqueuing mysg
+	// on gp.waiting where copystack can find it.
+	mysg.elem = ep
+	mysg.waitlink = nil
+	gp.waiting = mysg
+
+	mysg.g = gp
+	mysg.isSelect = false
+	mysg.c = c
+	gp.param = nil
+	c.recvq.enqueue(mysg)
+	if c.timer != nil {
+		blockTimerChan(c)
+	}
+
+	// Signal to anyone trying to shrink our stack that we're about
+	// to park on a channel. The window between when this G's status
+	// changes and when we set gp.activeStackChans is not safe for
+	// stack shrinking.
+	gp.parkingOnChan.Store(true)
+	reason := waitReasonChanReceive
+	if c.bubble != nil {
+		reason = waitReasonSynctestChanReceive
+	}
+	// 阻塞 receiver
+	gopark(chanparkcommit, unsafe.Pointer(&c.lock), reason, traceBlockChanRecv, 2)
+
+	// someone woke us up
+	// 被唤醒了
+	// 被唤醒的 goroutine 确实要接收数据（或完成发送），但在 Go runtime 的实现里，这一步其实已经在 唤醒前 完成了。（在 chansend 的逻辑里接收了）
+	// 这里是被唤醒后的代码主要是善后和清理工作
+	if mysg != gp.waiting {
+		throw("G waiting list is corrupted")
+	}
+	if c.timer != nil {
+		unblockTimerChan(c)
+	}
+	gp.waiting = nil
+	gp.activeStackChans = false
+	if mysg.releasetime > 0 {
+		blockevent(mysg.releasetime-t0, 2)
+	}
+	success := mysg.success
+	gp.param = nil
+	mysg.c = nil
+	releaseSudog(mysg)
+	return true, success
+}
+```
+
+### closechan
+```go
+func closechan(c *hchan) {
+	// 关闭 nil channel，panic
+	if c == nil {
+		panic(plainError("close of nil channel"))
+	}
+	if c.bubble != nil && getg().bubble != c.bubble {
+		fatal("close of synctest channel from outside bubble")
+	}
+
+	lock(&c.lock)
+	// 关闭已关闭的 channel，panic
+	if c.closed != 0 {
+		unlock(&c.lock)
+		panic(plainError("close of closed channel"))
+	}
+
+	if raceenabled {
+		callerpc := sys.GetCallerPC()
+		racewritepc(c.raceaddr(), callerpc, abi.FuncPCABIInternal(closechan))
+		racerelease(c.raceaddr())
+	}
+
+	c.closed = 1
+
+	var glist gList
+
+	// release all readers
+	for {
+		sg := c.recvq.dequeue()
+		if sg == nil {
+			break
+		}
+		if sg.elem != nil {
+			typedmemclr(c.elemtype, sg.elem)
+			sg.elem = nil
+		}
+		if sg.releasetime != 0 {
+			sg.releasetime = cputicks()
+		}
+		gp := sg.g
+		gp.param = unsafe.Pointer(sg)
+		sg.success = false
+		if raceenabled {
+			raceacquireg(gp, c.raceaddr())
+		}
+		glist.push(gp)
+	}
+
+	// release all writers (they will panic)
+	for {
+		sg := c.sendq.dequeue()
+		if sg == nil {
+			break
+		}
+		sg.elem = nil
+		if sg.releasetime != 0 {
+			sg.releasetime = cputicks()
+		}
+		gp := sg.g
+		gp.param = unsafe.Pointer(sg)
+		sg.success = false
+		if raceenabled {
+			raceacquireg(gp, c.raceaddr())
+		}
+		glist.push(gp)
+	}
+	unlock(&c.lock)
+
+	// Ready all Gs now that we've dropped the channel lock.
+	for !glist.empty() {
+		gp := glist.pop()
+		gp.schedlink = 0
+		goready(gp, 3)
+	}
+}
+```
+
 ## Context
 
-## Sync
-### Sync.Map
+## sync
+### sync.Map
+读多写少场景下，`sync.Map`比`sync.Mutex + map`性能更好。
+
+读少写多场景下，应更减少锁的粒度，`sync.Map`不适合该场景。
+```go
+type Map struct {
+	_ noCopy
+
+	mu Mutex
+
+	// read contains the portion of the map's contents that are safe for
+	// concurrent access (with or without mu held).
+	//
+	// The read field itself is always safe to load, but must only be stored with
+	// mu held.
+	//
+	// Entries stored in read may be updated concurrently without mu, but updating
+	// a previously-expunged entry requires that the entry be copied to the dirty
+	// map and unexpunged with mu held.
+
+	// read 包含了 map 中并发访问安全的那部分内容（无论是否持有互斥锁 mu）。
+	// 
+	// read 字段本身总是安全的，可以随时读取，但只有在持有 mu 锁的情况下才能写入。
+
+	// 存储在 read 中的条目可以在不持锁的情况下并发更新，但如果要更新一个之前已被标记为删除（expunged）的条目，
+	// 必须先将该条目复制到 dirty map，并在持锁的情况下将其标记为未删除（unexpunged）。
+	read atomic.Pointer[readOnly]
+
+	// dirty contains the portion of the map's contents that require mu to be
+	// held. To ensure that the dirty map can be promoted to the read map quickly,
+	// it also includes all of the non-expunged entries in the read map.
+	//
+	// Expunged entries are not stored in the dirty map. An expunged entry in the
+	// clean map must be unexpunged and added to the dirty map before a new value
+	// can be stored to it.
+	//
+	// If the dirty map is nil, the next write to the map will initialize it by
+	// making a shallow copy of the clean map, omitting stale entries.
+
+	// dirty 包含了 map 中需要持有 mu 锁才能访问的部分。
+	// 为了确保 dirty map 能够快速提升为 read map，它还包括 read map 中
+	// 所有未被标记为删除（non-expunged）的条目。
+	//
+	// 已标记为删除（expunged）的条目不会存储在 dirty map 中。
+	// 如果要对 clean map 中的 expunged 条目存储新值，必须先将其
+	// 取消删除（unexpunge）并加入 dirty map。
+	//
+	// 如果 dirty map 为 nil，则下一次对 map 的写操作会通过
+	// 对 clean map 进行浅拷贝并省略过时条目来初始化它。
+	dirty map[any]*entry
+
+	// misses counts the number of loads since the read map was last updated that
+	// needed to lock mu to determine whether the key was present.
+	//
+	// Once enough misses have occurred to cover the cost of copying the dirty
+	// map, the dirty map will be promoted to the read map (in the unamended
+	// state) and the next store to the map will make a new dirty copy.
+
+	// misses 记录自上次更新 read map 以来，需要加锁 mu 才能判断 key 是否存在的加载次数。
+	// 即：从上次更新 read map 以来，有多少次没从 read map 中找到 key
+	// 
+	// 一旦 misses 的数量足够抵消复制 dirty map 的成本，dirty map 将会被提升为 read map（处于未修改状态），
+	// 下一次对 map 的写操作将会创建一个新的 dirty 副本。
+	misses int
+}
+```
+
+#### load
+核心思想：读多写少优化 — 尽量无锁读取 read map，慢路径才加锁查 dirty map 并可能触发升级。
+
+1. 先读 read map：
+	- 如果 key 存在直接返回，无需加锁。
+2. 如果 read map 未命中且 amended 为 true：
+	- 加锁访问 dirty map。
+	- 在加锁状态下再尝试从 read map 找一次，防止在等待锁期间 dirty map 已经升级。
+	- 如果仍未命中，则从 dirty map 查找，并记录一次 miss。
+3. miss 次数统计：
+	- 当 misses 达到 dirty map 的长度时，将 dirty map 升级为新的 read map，并清空 dirty map 和 misses 计数。
+
+```go
+func (m *Map) Load(key any) (value any, ok bool) {
+	read := m.loadReadOnly()
+	// 从 read 中找
+	e, ok := read.m[key]
+	if !ok && read.amended {
+		// 没有从 read 中找到，加锁
+		m.mu.Lock()
+		// Avoid reporting a spurious miss if m.dirty got promoted while we were
+		// blocked on m.mu. (If further loads of the same key will not miss, it's
+		// not worth copying the dirty map for this key.)
+		
+		// 再尝试一次从 read 中找
+		read = m.loadReadOnly()
+		e, ok = read.m[key]
+		if !ok && read.amended {
+			// 还没有找到，继续在 dirty 中找
+			e, ok = m.dirty[key]
+			// Regardless of whether the entry was present, record a miss: this key
+			// will take the slow path until the dirty map is promoted to the read
+			// map.
+			m.missLocked()
+		}
+		m.mu.Unlock()
+	}
+	if !ok {
+		return nil, false
+	}
+	return e.load()
+}
+
+// 根据 misses 次数，决定是否将 dirty map 升级到 read
+// 原子操作
+func (m *Map) missLocked() {
+	m.misses++
+	if m.misses < len(m.dirty) {
+		return
+	}
+	m.read.Store(&readOnly{m: m.dirty})
+	m.dirty = nil
+	m.misses = 0
+}
+
+```
+
+#### store 
+核心思想：读多写少场景下先尝试无锁写，不行再将写操作安全落到 dirty map。
+
+**store 流程简述：**
+1. 快速路径：先在 read map 查找 key，存在且未删除则尝试无锁更新（CAS）。
+2. 慢路径：如果 key 不在 read 或已删除，加锁更新 dirty map。
+3. 新 key：第一次写入新 key 时，初始化 dirty map，并插入 entry。
+```go
+// Store sets the value for a key.
+func (m *Map) Store(key, value any) {
+	_, _ = m.Swap(key, value)
+}
+
+// trySwap swaps a value if the entry has not been expunged.
+//
+// If the entry is expunged, trySwap returns false and leaves the entry
+// unchanged.
+func (e *entry) trySwap(i *any) (*any, bool) {
+	for {
+		p := e.p.Load()
+		if p == expunged {
+			return nil, false
+		}
+		if e.p.CompareAndSwap(p, i) {
+			return p, true
+		}
+	}
+}
+
+// Swap swaps the value for a key and returns the previous value if any.
+// The loaded result reports whether the key was present.
+func (m *Map) Swap(key, value any) (previous any, loaded bool) {
+	// 如果 key 在 read 中，尝试通过 cas 进行无锁更新
+	read := m.loadReadOnly()
+	if e, ok := read.m[key]; ok {
+		if v, ok := e.trySwap(&value); ok {
+			if v == nil {
+				return nil, false
+			}
+			return *v, true
+		}
+	}
+
+	// 如果 key 不在 read 中，或者已经被标记删除，需要更新 dirty
+	m.mu.Lock()
+	read = m.loadReadOnly()
+	if e, ok := read.m[key]; ok {
+		// 如果是在 read 中，但是被标记删除了
+		// 先将 value 从 read 赋值到 dirty 中，存入新值，并读取原来的值
+		// “unexpunge Locked”通常用于计算机术语中，指的是一个文件或数据被锁定，并且无法被删除或修改
+		if e.unexpungeLocked() {
+			// The entry was previously expunged, which implies that there is a
+			// non-nil dirty map and this entry is not in it.
+			m.dirty[key] = e
+		}
+		if v := e.swapLocked(&value); v != nil {
+			loaded = true
+			previous = *v
+		}
+	} else if e, ok := m.dirty[key]; ok {
+		// 在 dirty 中已经存在，存入新值，并读取原来的值
+		if v := e.swapLocked(&value); v != nil {
+			loaded = true
+			previous = *v
+		}
+	} else {
+		// 第一次往 dirty map 添加新 key，需要做一些初始化工作
+		if !read.amended {
+			// We're adding the first new key to the dirty map.
+			// Make sure it is allocated and mark the read-only map as incomplete.
+			m.dirtyLocked()
+			m.read.Store(&readOnly{m: read.m, amended: true})
+		}
+		// 存入 dirty 中
+		m.dirty[key] = newEntry(value)
+	}
+	m.mu.Unlock()
+	return previous, loaded
+}
+```
+
+#### delete
+和 load 的流程基本一致。
+
+既有标记删除，又有原子删除。
+| 特性             | 原子删除（nil）                  | 标记删除（expunged）              |
+| -------------- | -------------------------- | --------------------------- |
+| 并发安全           | CAS 原子操作                   | CAS 原子操作                    |
+| 意义             | 值被删除，entry 可能还存在           | entry 永久不可用，防止被重用           |
+| 触发时机           | `Delete` 或 `LoadAndDelete` | dirty map 初始化 / 升级 read map |
+| 对 read map 的影响 | 无直接影响                      | 保证 read map 不可变             |
+
+##### 标记删除
+场景：dirty map 升级、第一次写入到新的 key 或 read→dirty 升级时。
+
+例如有一个 key 原本在 read map 中，但已经被删除（nil），然后 dirty map 初始化时，需要保证这个 entry 不会被误用。
+
+##### 原子删除
+场景：普通删除操作，例如 Delete 或 LoadAndDelete。 比如`m.Delete("foo")`时。
+
+`delete()`函数流程：
+1. 循环读取 p：
+	- p := e.p.Load() 获取 entry 当前存储的指针。
+2. 检查是否已删除或已被标记清除 (expunged)：
+	- 如果 p == nil 或 p == expunged，说明 entry 已经被删除或不可用，返回 nil, false。
+3. 尝试原子删除：
+	- 调用 CompareAndSwap(p, nil)，将当前值置为 nil。
+	- 如果成功，返回原来的值 *p 和 true。
+4. CAS 失败则重试：
+	- 循环继续，直到成功删除或发现 entry 已被清除。
+	
+```go
+// Delete deletes the value for a key.
+func (m *Map) Delete(key any) {
+	m.LoadAndDelete(key)
+}
+
+// LoadAndDelete deletes the value for a key, returning the previous value if any.
+// The loaded result reports whether the key was present.
+func (m *Map) LoadAndDelete(key any) (value any, loaded bool) {
+	read := m.loadReadOnly()
+	e, ok := read.m[key]
+	if !ok && read.amended {
+		m.mu.Lock()
+		read = m.loadReadOnly()
+		e, ok = read.m[key]
+		if !ok && read.amended {
+			e, ok = m.dirty[key]
+			delete(m.dirty, key)
+			// Regardless of whether the entry was present, record a miss: this key
+			// will take the slow path until the dirty map is promoted to the read
+			// map.
+			m.missLocked()
+		}
+		m.mu.Unlock()
+	}
+	if ok {
+		return e.delete()
+	}
+	return nil, false
+}
+
+func (e *entry) delete() (value any, ok bool) {
+	for {
+		p := e.p.Load()
+		if p == nil || p == expunged {
+			return nil, false
+		}
+		if e.p.CompareAndSwap(p, nil) {
+			return *p, true
+		}
+	}
+}
+```
 ### Sync.Once
-### 
+```go
+type Once struct {
+	_ noCopy
+
+	// done indicates whether the action has been performed.
+	// It is first in the struct because it is used in the hot path.
+	// The hot path is inlined at every call site.
+	// Placing done first allows more compact instructions on some architectures (amd64/386),
+	// and fewer instructions (to calculate offset) on other architectures.
+	done atomic.Bool
+	m    Mutex
+}
+```
+### Sync.Pool
+Pool 在首次使用后不能被拷贝。
+
+内部没有锁。对象保存在 per-P pool。
+
+Pool 的目的是缓存已分配但未使用的对象，以便后续重用，从而减轻垃圾回收器的压力。也就是说，它可以方便地构建高效、线程安全的空闲对象列表（free list），但并不适用于所有场景的 free list。
+```go
+type Pool struct {
+	noCopy noCopy
+
+	local     unsafe.Pointer // local fixed-size per-P pool, actual type is [P]poolLocal
+	localSize uintptr        // size of the local array
+
+	victim     unsafe.Pointer // local from previous cycle
+	victimSize uintptr        // size of victims array
+
+	// New optionally specifies a function to generate
+	// a value when Get would otherwise return nil.
+	// It may not be changed concurrently with calls to Get.
+	New func() any
+}
+```
