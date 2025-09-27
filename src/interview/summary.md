@@ -1,20 +1,145 @@
 ## scheduler
-<!-- toc -->
-
-Reference:
+**Reference:**
 - [Go scheduler](https://nghiant3223.github.io/2025/04/15/go-scheduler.html)
 - [Golang GMP 模型深度解析](https://blog.csdn.net/qq_44805265/article/details/152161116?spm=1001.2014.3001.5502)
-
+- [详解Go语言调度循环源码实现](https://www.luozhiyun.com/archives/448)
 ## 内存分配
 
+**Reference：**
+- [详解Go中内存分配源码实现](https://www.luozhiyun.com/archives/434)
 ## GC
 [GC图示](../assets/GC.pdf)
-### GC触发的时机
-- 阈值触发（内存分配时触发） mallogc
-- 定时触发 sysmon
-- 手动触发`runtime.GC`
-- `debug.FreeOSMemory`
 
+`Golang`的`gc`采用*三色标记法*，从 `GcRoots` 对象开始，
+
+
+`golang`在go 1.7版本之前采用了**插入写屏障**来解决漏标的问题。但需要在标记终止阶段 STW 时对这些栈进行重新扫描（re-scan）。原因如下所描述（由于没有 栈写屏障（stack write barrier），垃圾回收器在扫描栈时，不能保证这些指针在扫描之后不会被 Goroutine 改变，所以需要re-scan）：
+
+> without stack write barriers, we can‘t ensure that the stack won’t later contain a reference to a white object, so a scanned stack is only black until its goroutine executes again, at which point it conservatively reverts to grey. Thus, at the end of the cycle, the garbage collector must re-scan grey stacks to blacken them and finish marking any remaining heap pointers.
+
+### 三色标记法
+三色标记法将对象的颜色分为了黑、灰、白，三种颜色。
+
+- 黑色：该对象已经被标记过了，且该对象下的属性也全部都被标记过了（程序所需要的对象）；
+- 灰色：该对象已经被标记过了，但该对象下的属性没有全被标记完（GC需要从此对象中去寻找垃圾）；
+- 白色：该对象没有被标记过（对象垃圾）。
+
+在垃圾收集器开始工作时，从 GC Roots 开始进行遍历访问，访问步骤可以分为下面几步：
+1. GC Roots 根对象会被标记成灰色；
+2. 然后从灰色集合中获取对象，将其标记为黑色，将该对象引用到的对象标记为灰色；
+3. 重复步骤2，直到没有灰色集合可以标记为止；
+4. 结束后，剩下的没有被标记的白色对象即为 GC Roots 不可达，可以进行回收。
+
+由于标记阶段 `user goroutine` 和 `gc goroutine` 并发运行，所以会产生*漏标*或者*多标*的情况。
+- *多标*：a->b, a是黑，b是灰，之后接触a对b的引用，此时已经没有对象引用b。但由于b已经是灰色，最终会变成黑色。导致该被gc回收但是没有。不过下一轮gc会回收它，所以问题不严重，先不用管。
+- *漏标*：a, b, c。a为黑色，b为灰色，c为白色，初始时：b->c。改成a->c, 断开b和c。由于a已经标记为黑色不会再遍历，b也不指向c了，所以c遍历不到，但因为是白色，所以会被清除。不能接受的场景。
+
+所以引入了屏障技术来解决。
+### 强弱三色不变性：
+- **强三色不变性**：白色对象不能被黑色对象直接引用。插入写屏障（Dijkstra）的目标是实现强三色不变式，保证当一个黑色对象指向一个白色对象前，会先触发屏障将白色对象置为灰色，再建立引用.
+- **弱三色不变形**：白色对象可以被黑色对象引用，但要从某个灰对象出发仍然可达该白对象。删除写屏障（Yuasa barrier）的目标是实现弱三色不变式，保证当一个白色对象即将被上游删除引用前，会触发屏障将其置灰，之后再删除上游指向其的引用.
+
+都是用来解决*漏标*问题的。
+### 内存屏障
+#### 插入写屏障
+满足了强三色不变性
+
+如果该对象是白色的话，shade(ptr)会将对象标记成灰色。这样可以保证强三色不变性，它会保证 ptr 指针指向的对象在赋值给 *slot 前不是白色。
+```go
+writePointer(slot, ptr):
+    shade(ptr)
+    *slot = ptr
+```
+
+**缺点**：需要在标记终止阶段 STW 时对这些栈进行重新扫描（re-scan），因为没有 栈写屏障（stack write barrier），垃圾回收器在扫描栈时，不能保证这些指针在扫描之后不会被 Goroutine 改变
+
+#### 删除写屏障
+满足了弱三色不变性
+
+为了防止丢失从灰色对象到白色对象的路径，应该假设 *slot 可能会变为黑色， 为了确保 ptr 不会在被赋值到 *slot 前变为白色，shade(*slot) 会先将 *slot 标记为灰色， 进而该写操作总是创造了一条灰色到灰色或者灰色到白色对象的路径，这样删除写屏障就可以保证弱三色不变性，老对象引用的下游对象一定可以被灰色对象引用。
+```go
+writePointer(slot, ptr)
+    shade(*slot)
+    *slot = ptr
+```
+ 
+#### 混合写屏障
+> the write barrier shades the object whose reference is being overwritten, and, if the current goroutine's stack has not yet been scanned, also shades the reference being installed.
+>
+> 对正在被覆盖的对象进行着色，且如果当前栈未扫描完成， 则同样对指针进行着色。
+```go
+writePointer(slot, ptr):
+    shade(*slot)
+    if current stack is grey:
+        shade(ptr)
+    *slot = ptr
+```
+
+### GC触发的时机
+- 阈值触发（内存分配时触发， `runtime.mallocgc`）（gcTriggerHeap）
+- 定时触发 （sysmon 定时检查调用 `runtime.forcegchelper`）（gcTriggerTime）
+- 手动触发`runtime.GC`（gcTriggerCycle）
+```go
+// test reports whether the trigger condition is satisfied, meaning
+// that the exit condition for the _GCoff phase has been met. The exit
+// condition should be tested when allocating.
+func (t gcTrigger) test() bool {
+	if !memstats.enablegc || panicking.Load() != 0 || gcphase != _GCoff {
+		return false
+	}
+	switch t.kind {
+	case gcTriggerHeap:
+		// 当前已分配堆大小 ≥ 触发阈值
+		trigger, _ := gcController.trigger()
+		return gcController.heapLive.Load() >= trigger
+	case gcTriggerTime:
+		if gcController.gcPercent.Load() < 0 {
+			return false
+		}
+		// 距离上次 GC 时间超过 forcegcperiod（默认 2 分钟）。
+		lastgc := int64(atomic.Load64(&memstats.last_gc_nanotime))
+		return lastgc != 0 && t.now-lastgc > forcegcperiod
+	case gcTriggerCycle:
+		// 目标 GC 周期数 (t.n) 大于当前已执行的周期数 (work.cycles)
+		// 内部调度/测试用途，可以强制进入某个 GC 周期
+		// t.n > work.cycles, but accounting for wraparound.
+		return int32(t.n-work.cycles.Load()) > 0
+	}
+	return true
+}
+```
+### GC的阶段
+1.  执行 Sweep 终止阶段
+	1. 停止世界（STW），让所有 P 到达 GC 安全点。  
+	2. 清扫尚未清扫的内存 span。只有在本次 GC 被提前触发时，才会有未清扫的 span。  
+
+2. 执行标记阶段（Mark Phase）
+	1. 设置 `gcphase` 为 `_GCmark`（从 `_GCoff` 切换），启用写屏障，允许 mutator 辅助，并入队根对象标记任务。在所有 P 启用写屏障前，不允许扫描任何对象，这通过 STW 完成。  
+
+	2. 启动世界（恢复 mutator 运行）。从此刻起，GC 工作由调度器启动的标记工作线程（mark workers）以及分配过程中 mutator 的辅助完成。写屏障会“染色”被覆盖的旧指针和写入的新指针（详见 `mbarrier.go`）。新分配的对象立即标记为黑色。  
+
+	3. 执行根对象标记任务，包括扫描所有栈、标记全局变量以及 runtime 中堆外结构的指针。扫描栈会暂停对应的 Goroutine，标记其栈上的指针，然后恢复该 Goroutine。  
+
+	4. GC 排干灰色对象工作队列，将每个灰色对象标记为黑色，并标记其中的指针（这些指针可能被加入工作队列）。  
+
+	5. 因为 GC 工作分散在局部缓存，使用分布式终止算法判断是否还有根对象标记任务或灰色对象（`gcMarkDone`）。此时，GC 进入标记终止阶段。  
+
+3. 标记终止阶段（Mark Termination）
+	1. 停止世界。  
+
+	2. 设置 `gcphase` 为 `_GCmarktermination`，禁用工作线程和辅助。  
+
+	3. 执行清理工作，例如刷新 mcaches。  
+
+4. 清扫阶段（Sweep Phase）
+	1. 设置 `gcphase` 为 `_GCoff`，初始化清扫状态并禁用写屏障。  
+
+	2. 启动世界。此时新分配对象为白色，如果需要，分配前先清扫 span。  
+
+	3. GC 在后台进行并发清扫，也在分配时触发清扫。
+
+
+**mutator assists**：GC 标记的工作是分配 25% 的 CPU 来进行 GC 操作，所以有可能 GC 的标记工作线程比应用程序的分配内存慢，导致永远标记不完，那么这个时候就需要应用程序的线程来协助完成标记工作。
 Reference:
 - [go如何触发垃圾回收的](https://www.hitzhangjie.pro/blog/2022-11-20-go%E5%A6%82%E4%BD%95%E8%A7%A6%E5%8F%91%E5%9E%83%E5%9C%BE%E5%9B%9E%E6%94%B6/)
 
@@ -60,6 +185,21 @@ Goroutine 一起竞争锁的所有权。新来的 Goroutine 有优势，
 正常模式的性能要好得多，因为 Goroutine 可以连续多次
 获得互斥锁，即使此时还有其他等待者。
 而饥饿模式的意义在于避免极端情况下的尾部延迟问题。
+
+PS: 饥饿模式是为了公平，避免 goroutine 长时间获取不到锁
+
+
+工作模式：Mutex 有两种工作模式：
+
+1. 正常模式 （Normal Mode）：
+	1. 当一个 goroutine 请求锁时，如果锁未被持有，它会立即获得锁。
+	2.如果锁已被持有，它会通过几次*自旋（Spinning）*尝试获取锁。自旋是指在不挂起 goroutine 的情况下，进行忙等待循环。这对于锁很快会被释放的场景能提升性能。
+	3.如果自旋后仍未获取到锁，goroutine 会被加入等待队列并挂起。
+	4. 当锁被释放时，会唤醒等待队列中的一个 goroutine。被唤醒的goroutine 和新来的goroutine 会公平竞争。
+2. 饥饿模式（Starving Mode）：
+	1. 如果一个 goroutine 等待锁的时间超过了 1ms，`Mutex` 会切换囚到饥饿模式。
+	2. 在饥饿模式下，锁的所有权会直接交接给等待队列中的队头 goroutine，新来的goroutine 即使自旋也无法获取锁。
+	3.目的：防止等待队列中的 aoroutine 因为不断有新来的“插队者”而长时间“饿死”保证了公平性。
 ### 指令重排
 为了提高cpu指令吞吐
 
@@ -115,6 +255,8 @@ CAS 是一种 原子操作，用于多线程/多 goroutine 下安全地修改共
 2. 在该线程还未执行 CAS 前，其他线程把 V 从 A 改成 B，又改回 A。
 3. 第一个线程执行 CAS 时，看到的仍然是 A，认为没有变化，于是 CAS 成功。
 
+**Reference:**
+- [浅析 Golang Mutex 源码 基于 Golang 1.21.0](https://zhuanlan.zhihu.com/p/661380439)
 ## Slice
 ### go1.18之前
 1. 如果期望容量大于旧的容量的两倍，直接用期望容量
@@ -1330,12 +1472,12 @@ func (m *Map) Swap(key, value any) (previous any, loaded bool) {
 | 触发时机           | `Delete` 或 `LoadAndDelete` | dirty map 初始化 / 升级 read map |
 | 对 read map 的影响 | 无直接影响                      | 保证 read map 不可变             |
 
-##### 标记删除
+** 标记删除**:
 场景：dirty map 升级、第一次写入到新的 key 或 read→dirty 升级时。
 
 例如有一个 key 原本在 read map 中，但已经被删除（nil），然后 dirty map 初始化时，需要保证这个 entry 不会被误用。
 
-##### 原子删除
+** 原子删除**:
 场景：普通删除操作，例如 Delete 或 LoadAndDelete。 比如`m.Delete("foo")`时。
 
 `delete()`函数流程：
