@@ -19,6 +19,9 @@ Reference:
 - [go如何触发垃圾回收的](https://www.hitzhangjie.pro/blog/2022-11-20-go%E5%A6%82%E4%BD%95%E8%A7%A6%E5%8F%91%E5%9E%83%E5%9C%BE%E5%9B%9E%E6%94%B6/)
 
 ## Mutex
+在可以快速处理的简单临界资源中, `mutex` 的性能几乎和 `atomic` 一样.这是因为 `mutex` 是用*乐观思想优化过的悲观锁*,当发生竞态时,会自旋 4 次,在自旋的过程中,锁可能就被释放了.所以性能几乎相差无几.
+
+
 ```go
 type Mutex struct {
 	state int32
