@@ -85,7 +85,7 @@ Happens-before (HB) 是并发编程里的一个核心概念，用来描述 操�
 - sadl
 
 #### cas
-CAS 是一种 原子操作，用于多线程/多 goroutine 下安全地修改共享变量。底层是CPU 提供的原子指令。
+CAS 是一种 原子操作，用于多线程/多 goroutine 下安全地修改共享变量。底层是CPU 提供的原子指令`lock`。
 
 操作步骤：
 1. 读取内存地址 addr 的当前值 v
