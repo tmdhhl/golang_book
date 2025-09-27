@@ -1428,3 +1428,7 @@ type Pool struct {
 	New func() any
 }
 ```
+
+## 一些不错的文章/blog
+- https://blog.csdn.net/qq_44805265/category_13054959.html
+- https://www.zhihu.com/people/josefa_zyq/posts

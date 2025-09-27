@@ -3,3 +3,7 @@ authors = ["tmdhhl"]
 language = "en"
 src = "src"
 title = "golang src"
+
+[output.html]
+additional-css = ["theme/pagetoc.css"]
+additional-js = ["theme/pagetoc.js"]
