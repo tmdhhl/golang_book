@@ -1254,6 +1254,8 @@ func closechan(c *hchan) {
 ```
 
 ## Context
+Go的Context主要解决三个核心问题：**超时控制**、**取消信号传播**和**请求级数据传递**
+
 
 ## sync
 ### sync.Map
@@ -1573,6 +1575,28 @@ type Pool struct {
 }
 ```
 
+## 常见题
+### Go语言在什么情况下会发生内存泄漏？
+- **goroutine泄漏：**这是最常见的泄漏场景。goroutine没有正常退出会一直占用内存，比如从channel读取数据但channel永远不会有数据写入，或者死循环没有退出条件。我在项目中遇到过，启动了处理任务的 goroutine但没有合适的退出机制，导致随着请求增加goroutine越来越多。
+
+- **channel泄漏**：未关闭的channel和等待channel的goroutine会相互持有引用。比如生产者已经结束但没有关闭channel，消费者goroutine会一直阻塞等待，造成内存无法回收。
+
+- **slice引用大数组**：当slice引用一个大数组的小部分时，整个底层数组都无法被GC回收。解决方法是使用copy创建新的slice。
+
+- **map元素过多**：map中删除元素只是标记删除，底层bucket不会缩减。如果map曾经很大后来元素减少，内存占用仍然很高。
+
+- **定时器未停止**： time.After 或 time.NewTimer 创建的定时器如果不手动停止，会在heap中持续存在。
+
+- **循环引用**：虽然Go的GC能处理循环引用，但在某些复杂场景下仍可能出现问题。
+### GC 关注的指标有哪些？
+- CPU 利用率：回收算法会在多大程度上拖慢程序？有时候，这个是通过回收占用的CPU 时间与其它CPU 时间的百分比来描述的。
+- GC停顿时间：回收器会造成多长时间的停顿？目前的 GC 中需要考虑 STW 和 Mark Assist 两个部分可能造成的停顿。
+- GC停顿频率：回收器造成的停顿频率是怎样的？目前的 GC 中需要考虑 STW 和 Mark Assist 两个部分可能造成的停顿。
+- GC 可扩展性：当堆内存变大时，垃圾回收器的性能如何？但大部分的程序可能并不一定关心这个问题。
+### Go 的 GC 如何调优？
+1. 合理化内存分配的速度、提高赋值器的CPU 利用率
+2. 降低并复用已经申请的内存，比如使用sync.pool复用经常需要创建的重复对象
+3. 调整 GOGC，可以适量将 GOGC 的值设置得更大，让GC 触发的时间变得更晚，从而减少其触发频率，进而增加用户代码对机器的使用率
 ## 一些不错的文章/blog
 - https://blog.csdn.net/qq_44805265/category_13054959.html
 - https://www.zhihu.com/people/josefa_zyq/posts
