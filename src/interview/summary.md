@@ -61,6 +61,8 @@
 - [Go 语言设计与实现](https://draven.co/golang/docs/part3-runtime/ch06-concurrency/golang-goroutine/)
 
 ## 内存分配
+![内存](https://excalidraw.com/#json=jhG7i2ZgI0k5sBjx3T3i3,XHy7ilAmDCavs_aOBbnJCA)
+
 
 ### 内存分配触发GC和辅助标记GC
 - 如果当前没有触发GC，当前goroutine正在执行内存分配
