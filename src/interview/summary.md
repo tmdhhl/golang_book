@@ -61,8 +61,50 @@
 - [Go 语言设计与实现](https://draven.co/golang/docs/part3-runtime/ch06-concurrency/golang-goroutine/)
 
 ## 内存分配
-![内存](https://excalidraw.com/#json=jhG7i2ZgI0k5sBjx3T3i3,XHy7ilAmDCavs_aOBbnJCA)
+[内存布局](https://excalidraw.com/#json=3l_PLDvVUx_aEz-oDaqSX,jvs-dvfWcYFbdIp7dApdhg)
 
+### 堆内存分配逻辑
+- 微对象 <16bytes 且不含指针: tiny allocator, mcache
+- 小对象 16bytes-32kb || 含指针: span allocator， mcache
+	- 根据申请的size向上取整到对应的size class对应的span。
+	- 如果mspan中没有足够的空间，则mcache向mcentral申请新的对应span（优先从对应span的NonEmptyList(Partial Set)中分配，NonEmptyList不足则从EmptyList(Full Set)中分配），剩余的补充到mcache自己对应的mspan中
+	- 如果mcentral没有足够的内存，则向mheap申请新的span
+	- 如果mheap没有足够的内存，则向操作系统申请新的内存
+	```
+	          ┌───────────────┐
+          │    MCentral   │
+          └───────────────┘
+                │
+   ┌────────────┴────────────┐
+   │                         │
+partial[swept]         full[swept]
+（可分配）             （已满 span）
+   │
+   │  GC 开始 → unswept ← GC 结束后再变 swept
+   ▼
+partial[unswept]
+（等待 sweep）
+
+	```
+- 大对象 >32kb: mmap, mheap
+![分配逻辑](../../assets/go_memory_alloc.jpg)
+![分配逻辑](https://qiankunli.github.io/public/upload/go/go_memory_alloc.jpg)
+
+### 为什么有tiny allocator
+因为mcache中最小的size class=1，对应的内存是8 bytes。如果没有tiny allocator，所有int32，bool，byte等只需要一个字节的类型都会匹配size class=1的bytes空间并独享该空间，造成资源浪费。
+
+### 内存分配相关
+- goroutine栈默认大小2kb。
+- golang中page是*8k*，linux中page是*4k*。
+	- 如果对象小于 8 KB，每个页可以容纳多个相同大小的对象；如果对象大小正好为 8 KB，则每个页只容纳一个对象。大于 8 KB 的对象会跨越多个页。
+- go进程的栈指的是主线程`m0`的`g0`的栈，也叫做系统栈。
+- 对于小于 512 字节的对象，Go 使用跨度（spans）分配内存，并使用堆位图（heap bitmap）来跟踪跨度中哪些字包含指针
+- 对于大于 512 字节的对象，维护一个大的位图效率不高。相反，每个对象都伴随着一个 8 字节的 malloc 头部——一个指向对象类型信息的指针
+- Go 引入了位图摘要的概念，摘要包含三个字段： start 、 end 和 max 。 start 是位图开头连续的 0 比特数。类似地， end 是位图末尾连续的 0 比特数。最后， max 代表最大的连续 0 比特序列。摘要会在位图被修改时立即更新，即当页被分配或释放时。
+- 通过合并低层级摘要，Go 隐式地构建了一个分层结构，从而能够高效地跟踪连续的空闲页。它使用一个**全局的摘要基数树**来管理整个虚拟地址空间。
+- The traditional Heap segment, which is located under the program break, is not utilized by the Go runtime to allocate heap objects. Instead, Go runtime relies heavily on memory-mapped segments for allocating memory for heap objects and goroutine stacks.
+![go memory layout](../../assets/go_virtual_memory_view.png)
+![alt text](https://nghiant3223.github.io/assets/2025-06-03-memory_allocation_in_go/go_virtual_memory_view.png)
 
 ### 内存分配触发GC和辅助标记GC
 - 如果当前没有触发GC，当前goroutine正在执行内存分配
@@ -90,6 +132,7 @@
 6. 延迟调用函数导致的临时性内存泄露
 
 **Reference：**
+- [go堆内存分配](https://qiankunli.github.io/2020/11/22/go_mm.html)
 - [详解Go中内存分配源码实现](https://www.luozhiyun.com/archives/434)
 - [go如何触发垃圾回收的](https://www.hitzhangjie.pro/blog/2022-11-20-go%E5%A6%82%E4%BD%95%E8%A7%A6%E5%8F%91%E5%9E%83%E5%9C%BE%E5%9B%9E%E6%94%B6/)
 ## GC
