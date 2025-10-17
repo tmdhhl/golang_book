@@ -4,6 +4,8 @@
 - [Golang GMP 模型深度解析](https://blog.csdn.net/qq_44805265/article/details/152161116?spm=1001.2014.3001.5502)
 - [详解Go语言调度循环源码实现](https://www.luozhiyun.com/archives/448)
 ## 内存分配
+![内存](https://excalidraw.com/#json=jhG7i2ZgI0k5sBjx3T3i3,XHy7ilAmDCavs_aOBbnJCA)
+
 
 **Reference：**
 - [详解Go中内存分配源码实现](https://www.luozhiyun.com/archives/434)
