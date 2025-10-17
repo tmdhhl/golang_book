@@ -1,12 +1,95 @@
 ## scheduler
+**GMP模型**：G-goroutine，m-物理线程的封装，p-存储g，绑定到M后g可以被执行，是G眼里的cpu。
+
+**P和M的最大值**：M最大10000，P：GOMAXPROCS限制。二者默认都是GOMAXPROCS
+
+**调度流程**：首先是schedule()函数，调用findRunable()去寻找g，找到g后，调用gogo()切换到g上进行运行。
+运行过程中，如果遇到系统调用，是异步系统调用（网络IO），就把g挂载到netpoll上，m继续执行p中其他的g。如果是同步系统调用（如基于文件的系统调用。如果你在使用 CGO，调用 C 函数也可能导致 M 阻塞），会阻塞g和m，此时将p与m分离，但是m会记录oldP，p重新寻找m以运行里面的g，如果没有可用的m，就新建。
+
+当异步系统调用完成时，g会被放到某个P的Runnext中执行。同步系统调用返回时，会优先尝试获取m对应的oldP，不行（因为Go 的 sysmon（内部监控线程）发现有这种卡了超过 10 ms 的 M ，那么就会把 P 剥离出来，给到其他的 M 去处理执行，M 数量不够就会新创建。）就去找其他P，如果没有可用，就把g设置为可执行状态放到全局队列中，m则挂起，加入到空闲线程中。
+
+**主动调度**：
+	- 主动调度
+	- 同步内存访问，加锁等阻塞操作
+	- 正常执行结束角度
+
+**抢占式调度**：
+	- 由sysmon（不需要p就能执行）负责，如果检测到某个P的状态为Psyscall（系统调用），并且它已经运行了超过10ms，则会将P的当前的G的stackguard设置为StackPreempt。这个操作其实是相当于加上一个标记，通知这个G在合适时机进行调度。Go会在每个函数入口处比较当前的栈寄存器值和stackguard值来决定是否触发morestack函数。将stackguard设置为StackPreempt作用是进入函数时必定触发morestack，然后在morestack中再引发调度。（但是如果是死循环，不会再次进入函数，就抢占不了了）
+	- 基于信号的抢占（也叫异步抢占）：preemptM()通过runtime.signalM()向制定的m发送sigPreempt信号，m接收到信号执行runtime.sighandler()调用doSigPreempt()确认执行上下文能安全抢占后进行异步抢占。
+	
+	异步抢占的本质是在为垃圾回收器服务。
+
+	> 1. M1 发送中断信号（signalM(mp, sigPreempt)）
+	> 2. M2 收到信号，操作系统中断其执行代码，并切换到信号处理函数（sighandler(signum, info, ctxt, gp)）
+	> 3. M2 修改执行的上下文，并恢复到修改后的位置（asyncPreempt）
+	> 4. 重新进入调度循环进而调度其他 Goroutine（preemptPark 和 gopreempt_m)
+
+**sysmon的作用**：
+- 释放闲置超过5分钟的span物理内存
+- 如果超过2分钟没有执行垃圾回收，强制执行
+- 将长时间未处理的netpoll结果添加到任务队列
+- 向长时间(10ms)运行的G发出抢占调度
+- 收回因同步syscall长时间阻塞的P
+
+**GO调度的时机**
+1. 使用关键字go
+2. GC，因为GC的goroutine要在m上运行，所以要进行调度
+3. 系统调用
+4. 同步内存访问
+5. 手动调用runtime.Gosched()
+
+
+** m的自旋
+为了避免频繁地挂起和恢复M。分为两种自旋，二者之和不超过GOMAXPROCS
+1. 有关联P的M，自旋寻找可执行的G
+2. 无关联P的M，自旋寻找可用的P
+
+当第二种自旋M存在时，第一种自旋的M不会被挂起。
+
+
+
 **Reference:**
 - [Go scheduler](https://nghiant3223.github.io/2025/04/15/go-scheduler.html)
 - [Golang GMP 模型深度解析](https://blog.csdn.net/qq_44805265/article/details/152161116?spm=1001.2014.3001.5502)
 - [详解Go语言调度循环源码实现](https://www.luozhiyun.com/archives/448)
+- [golang 系统调用与阻塞处理](https://qiankunli.github.io/2020/11/21/goroutine_system_call.html)
+- [抢占式调度](https://tiancaiamao.gitbooks.io/go-internals/content/zh/05.5.html)
+- [Golang GMP 原理](https://mp.weixin.qq.com/s/jIWe3nMP6yiuXeBQgmePDg)
+- [goroutine调度器揭秘 2](https://colobu.com/2024/03/24/goroutine-scheduler-2/)
+- [详解Go语言调度循环源码实现](https://www.luozhiyun.com/archives/448)
+- [GMP 原理与调度](https://www.topgoer.com/%E5%B9%B6%E5%8F%91%E7%BC%96%E7%A8%8B/GMP%E5%8E%9F%E7%90%86%E4%B8%8E%E8%B0%83%E5%BA%A6.html)
+- [Go 语言设计与实现](https://draven.co/golang/docs/part3-runtime/ch06-concurrency/golang-goroutine/)
+
 ## 内存分配
+
+### 内存分配触发GC和辅助标记GC
+- 如果当前没有触发GC，当前goroutine正在执行内存分配
+	- 根据当前内存分配的量来确定是否shouldhelpgc（>32K一定为true，反之则要根据是否有span不足refill）
+		- 如果否就分配完内存该干嘛干嘛去就完了
+		- 如果需要辅助gc，首先先计算下当前trigger（上面详细描述了如何计算的），然后比较下当前heapLive、trigger的大小
+			- 如果heapLive < trigger，不用触发GC，该干嘛干嘛
+			- 如果heapLive > trigger，发起GC，即调用gcStart()，这里其实是发起一轮完整的GC，等它完成后再返回来该干嘛干嘛
+- 当有其他goroutine发起了GC，进入GCMark阶段后gcBlackenEnabled=1表示其他mutator要把新分配对象标记为黑，可以理解成当前进入GC阶段了
+	- 每一个goroutine都要维护一个账本，自己分配了多少内存，自己辅助标记了多少内存
+	- 如果自己分配的内存没有超过辅助标记的内存，gcAssistBytes>0，没欠债该干嘛干嘛去
+	- 如果自己分配的内存超过自己辅助标记的内存，表示自己欠债了，欠债了怎么办？就得还债，还债就得去辅助标记内存，这就是我们说的markAssist
+		- 如果我要分配npages的内存，那么要辅助扫描多少内存呢，这个运行时有个计算规则，总的目标是在GC发起后、内存占用达到heapGoal之前我能把所有的内存扫描完
+		- 确定了要扫描多少内存后，就可以去干活了？等等，当前goroutine欠的债，也可以先找大佬帮还一下，这就是bgMarkWorker攒的credit（bytes），如果一次还不完，欠多少就是多少，自己去扫描就完了 ps: 这样有个好处，当前goroutine可以不用引入扫描内存的开销就可以继续干自己该干的事情。
+	- 这个阶段会更新当前goroutine的这个账本，如果当前GC Cycle内它还有动作，就可以继续拿来秋后算账
+### 内存泄漏的场景：
+1. 子字符串造成的暂时性内存泄露
+2. 子切片造成的暂时性内存泄露
+3. 协程被永久阻塞而造成的永久性内存泄露
+	- Go运行时很难分辨出一个处于阻塞状态的协程是永久阻塞还是暂时性阻塞
+	- 有时我们可能故意永久阻塞某些协程。
+4. 没有停止不再使用的time.Ticker值而造成的永久性内存泄露
+	- 当一个time.Timer值不再被使用，一段时间后它将被自动垃圾回收掉。 但对于一个不再使用的time.Ticker值，我们必须调用它的Stop方法结束它，否则它将永远不会得到回收
+5. 不正确地使用终结器（finalizer）而造成的永久性内存泄露（可以不用记）
+6. 延迟调用函数导致的临时性内存泄露
 
 **Reference：**
 - [详解Go中内存分配源码实现](https://www.luozhiyun.com/archives/434)
+- [go如何触发垃圾回收的](https://www.hitzhangjie.pro/blog/2022-11-20-go%E5%A6%82%E4%BD%95%E8%A7%A6%E5%8F%91%E5%9E%83%E5%9C%BE%E5%9B%9E%E6%94%B6/)
 ## GC
 [GC图示](../assets/GC.pdf)
 
@@ -142,7 +225,7 @@ func (t gcTrigger) test() bool {
 **mutator assists**：GC 标记的工作是分配 25% 的 CPU 来进行 GC 操作，所以有可能 GC 的标记工作线程比应用程序的分配内存慢，导致永远标记不完，那么这个时候就需要应用程序的线程来协助完成标记工作。
 Reference:
 - [go如何触发垃圾回收的](https://www.hitzhangjie.pro/blog/2022-11-20-go%E5%A6%82%E4%BD%95%E8%A7%A6%E5%8F%91%E5%9E%83%E5%9C%BE%E5%9B%9E%E6%94%B6/)
-
+- [Garbage Collection In Go : Part I - Semantics](https://www.ardanlabs.com/blog/2018/12/garbage-collection-in-go-part1-semantics.html)
 ## Mutex
 在可以快速处理的简单临界资源中, `mutex` 的性能几乎和 `atomic` 一样.这是因为 `mutex` 是用*乐观思想优化过的悲观锁*,当发生竞态时,会自旋 4 次,在自旋的过程中,锁可能就被释放了.所以性能几乎相差无几.
 
@@ -653,9 +736,11 @@ func evacuate(t *maptype, h *hmap, oldbucket uintptr) {
 **新旧数据迁移在什么时候**：渐进式迁移，在访问、赋值、删除时。
 ### go1.24之后
 
+**什么是SIMD**：（Single Instruction Multiple Data）单指令流多数据流。是一种并行计算技术，可以同时对多个数据执行相同的操作。使用 SIMD 的主要目的是为了提升计算性能。
 **Referrence:**
 <!-- 1.24之前 -->
 - [浅谈Golang 1.21.0 map源码](https://zhuanlan.zhihu.com/p/653518993)
+- [GoLang Map 实现分析](https://blog.csdn.net/cugriver/article/details/126276610)
 <!-- 1.24之后 -->
 - [Faster Go maps with Swiss Tables](https://go.dev/blog/swisstable)
 - [How Go 1.24's Swiss Tables saved us hundreds of gigabytes](https://www.datadoghq.com/blog/engineering/go-swiss-tables/)

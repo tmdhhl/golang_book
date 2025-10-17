@@ -1,7 +1,7 @@
 1. 最长连续序列: https://leetcode.cn/problems/longest-consecutive-sequence/submissions/?envType=study-plan-v2&envId=top-100-liked
 2. 接雨水：https://leetcode.cn/problems/trapping-rain-water/submissions/660301830/?envType=study-plan-v2&envId=top-100-liked
 3. 和为 K 的子数组: https://leetcode.cn/problems/subarray-sum-equals-k/description/?envType=study-plan-v2&envId=top-100-liked
-*** 4. 最大子数组和：https://leetcode.cn/problems/maximum-subarray?envType=study-plan-v2&envId=top-100-liked
+过了 *** 4. 最大子数组和：https://leetcode.cn/problems/maximum-subarray?envType=study-plan-v2&envId=top-100-liked
 
 *** 5. 随机链表复制 https://leetcode.cn/problems/copy-list-with-random-pointer/submissions/646027291/?envType=study-plan-v2&envId=top-100-liked
 
@@ -17,7 +17,10 @@
 
 10. 课程表：https://leetcode.cn/problems/course-schedule/?envType=study-plan-v2&envId=top-100-liked
 
+矩阵：4
+链表：14
 
+二叉树：15
 
 图论：4
 994. 腐烂的橘子: https://leetcode.cn/problems/rotting-oranges/?envType=study-plan-v2&envId=top-100-liked
@@ -27,7 +30,7 @@
 
 *** 79. 单词搜索：https://leetcode.cn/problems/word-search/description/?envType=study-plan-v2&envId=top-100-liked
 
-*** 131. 分割回文串：https://leetcode.cn/problems/palindrome-partitioning/?envType=study-plan-v2&envId=top-100-liked
+**** 131. 分割回文串：https://leetcode.cn/problems/palindrome-partitioning/?envType=study-plan-v2&envId=top-100-liked
 
 51. N皇后：https://leetcode.cn/problems/n-queens/submissions/663653021/?envType=study-plan-v2&envId=top-100-liked
 二分查找：6

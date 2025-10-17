@@ -56,7 +56,7 @@ Go 语言的垃圾收集可以分成清除终止、标记、标记终止和清�
 **P和M的最大值**：M最大10000，P：GOMAXPROCS限制。二者默认都是GOMAXPROCS
 
 **调度流程**：首先是schedule()函数，调用findRunable()去寻找g，找到g后，调用gogo()切换到g上进行运行。
-运行过程中，如果遇到系统调用，是异步系统调用（网络IO），就把g挂载到netpoll上，m继续执行p中其他的g。如果是同步系统调用（如文件IO），会阻塞g和m，此时将p与m分离，但是m会记录oldP，p重新寻找m以运行里面的g，如果没有可用的m，就新建。
+运行过程中，如果遇到系统调用，是异步系统调用（网络IO），就把g挂载到netpoll上，m继续执行p中其他的g。如果是同步系统调用（如基于文件的系统调用。如果你在使用 CGO，调用 C 函数也可能导致 M 阻塞），会阻塞g和m，此时将p与m分离，但是m会记录oldP，p重新寻找m以运行里面的g，如果没有可用的m，就新建。
 
 当异步系统调用完成时，g会被放到某个P的Runnext中执行。同步系统调用返回时，会优先尝试获取m对应的oldP，不行（因为Go 的 sysmon（内部监控线程）发现有这种卡了超过 10 ms 的 M ，那么就会把 P 剥离出来，给到其他的 M 去处理执行，M 数量不够就会新创建。）就去找其他P，如果没有可用，就把g设置为可执行状态放到全局队列中，m则挂起，加入到空闲线程中。
 
@@ -66,7 +66,7 @@ Go 语言的垃圾收集可以分成清除终止、标记、标记终止和清�
 	- 正常执行结束角度
 
 **抢占式调度**：
-	- 由sysmon（不需要p就能执行）负责，如果检测到某个P的状态为Prunning，并且它已经运行了超过10ms，则会将P的当前的G的stackguard设置为StackPreempt。这个操作其实是相当于加上一个标记，通知这个G在合适时机进行调度。Go会在每个函数入口处比较当前的栈寄存器值和stackguard值来决定是否触发morestack函数。将stackguard设置为StackPreempt作用是进入函数时必定触发morestack，然后在morestack中再引发调度。（但是如果是死循环，不会再次进入函数，就抢占不了了）
+	- 由sysmon（不需要p就能执行）负责，如果检测到某个P的状态为Psyscall（系统调用），并且它已经运行了超过10ms，则会将P的当前的G的stackguard设置为StackPreempt。这个操作其实是相当于加上一个标记，通知这个G在合适时机进行调度。Go会在每个函数入口处比较当前的栈寄存器值和stackguard值来决定是否触发morestack函数。将stackguard设置为StackPreempt作用是进入函数时必定触发morestack，然后在morestack中再引发调度。（但是如果是死循环，不会再次进入函数，就抢占不了了）
 	- 基于信号的抢占（也叫异步抢占）：preemptM()通过runtime.signalM()向制定的m发送sigPreempt信号，m接收到信号执行runtime.sighandler()调用doSigPreempt()确认执行上下文能安全抢占后进行异步抢占。
 	
 	异步抢占的本质是在为垃圾回收器服务。
@@ -135,10 +135,108 @@ Go 语言的垃圾收集可以分成清除终止、标记、标记终止和清�
 
 18. defer语句的执行顺序
 19. for range的使用中，地址会发生变化吗
+某个版本（Go 1.22）后会变化了
+20. goroutine panic
+- 外层goroutine中定义的recover() 无法捕获子 goroutine 抛出的 panic.
+	- recover 只有在 defer 中调用才会生效；
+	- panic 允许在 defer 中嵌套多次调用；
+	- panic 只会对当前 Goroutine 的 defer 有效
 
+21. 值接收者和指针接收者的区别
+	- 接收者类型是值类型还是指针类型，都可以通过值类型或指针类型调用。通过语法糖实现。
+	```go
+	package main
+
+	import "fmt"
+
+	type Person struct {
+		age int
+	}
+
+	func (p *Person) Age() int {
+		return p.age
+	}
+
+	func (p *Person) SetAge(age int) int {
+		p.age = age
+		return p.age
+	}
+
+	func main() {
+		p1 := &Person{age: 100}
+		fmt.Println(p1.age)
+		p1.SetAge(101)
+		fmt.Println(p1.age)
+
+		p2 := Person{age: 200}
+		fmt.Println(p2.age)
+		p2.SetAge(201)
+		fmt.Println(p2.age)
+	}
+
+	// 输出
+	// 100
+	// 101
+	// 200
+	// 201
+	```
+	- 实现了接收者是值类型的方法，相当于自动实现了接收者是指针类型的方法；而实现了接收者是指针类型的方法，不会自动生成对应接收者是值类型的方法。
+	```go
+	package main
+
+	import "fmt"
+
+	type coder interface {
+		code()
+		debug()
+	}
+
+	type Gopher struct {
+		language string
+	}
+
+	func (p Gopher) code() {
+		fmt.Printf("I am coding %s language\n", p.language)
+	}
+
+	func (p *Gopher) debug() {
+		fmt.Printf("I am debuging %s language\n", p.language)
+	}
+
+	func main() {
+		var c coder = &Gopher{"Go"}
+		c.code()
+		c.debug()
+	}
+
+	// 输出
+	// I am coding Go language
+	// I am debuging Go language
+
+	// 如果把 var c coder = &Gopher{"Go"}改成	var c coder = Gopher{"Go"}
+	// 报错：
+	// ./main.go:23:16: cannot use Gopher{…} (value of struct type Gopher) as coder value in variable declaration: Gopher does not implement coder (method debug has pointer receiver)
+	// 因为实现了func (p Gopher) code() {相当于也实现了func (p *Gopher) code() {
+	// 但是实现了func (p *Gopher) debug() 不会自动实现func (p Gopher) debug()，所以报错
+
+	// 为什么这样？
+	// 接收者是指针类型的方法，很可能在方法中会对接收者的属性进行更改操作，从而影响接收者；而对于接收者是值类型的方法，在方法中不会对接收者本身产生影响。
+	```
 
 场景题：
 1. 从无限的字符流中，随机选出10个字符
+	- 算法步骤（以 k=10 为例）：
+		a. 前 10 个元素：直接放入样本池（reservoir）。
+		b. 从第 11 个元素开始（第 i 个）：
+		c. 以概率 10 / i 选中这个元素； 
+		d. 如果选中，就随机替换样本池中的一个元素。j := rand.Intn(i); if j < k {reservoir[j] = stream[i]}
 2. 设计一个抢红包的系统架构，如何保证每个人抢到、如何扛住流量？
 3. 给你一个10PB文件 3000台机器，怎么做字典树排序？
 4. 一个文件里有40亿个数字，找出最大的10个数字
+
+
+### 分布式
+#### 分布式锁
+**Referrences:**
+- [分布式锁的设计](https://zouyingjie.github.io/cloudnativenotes/distributed-system-engineering/distributed-lock.html)
+- [分布式锁方案的思考](https://www.hitzhangjie.pro/blog/2022-09-25-%E5%88%86%E5%B8%83%E5%BC%8F%E9%94%81%E6%96%B9%E6%A1%88%E7%9A%84%E6%80%9D%E8%80%83/#%E6%96%B9%E6%A1%882%E7%A8%8D%E5%BE%AE%E9%80%9A%E7%94%A8%E7%82%B9%E7%9A%84%E5%88%86%E5%B8%83%E5%BC%8F%E9%94%81%E6%96%B9%E6%A1%88)
