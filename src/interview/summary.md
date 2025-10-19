@@ -1,4 +1,54 @@
 ## scheduler
+### go调度初始化流程
+```
+TEXT runtime·rt0_go(SB),NOSPLIT,$0
+    // 初始化栈、TLS、argc/argv 等...
+    MOVQ $runtime·g0(SB), CX     // g = &g0
+    MOVQ CX, g
+    MOVQ $runtime·m0(SB), AX     // m = &m0
+    MOVQ AX, g_m(g)              // g0.m = &m0
+    ...
+    CALL runtime·schedinit(SB)
+    CALL runtime·newproc(SB)
+    CALL runtime·mstart(SB)
+
+##################################
+_rt0_go
+└── rt0_go // 初始化m0,g0并建立 g0/m0 临时绑定，设置基本寄存器环境
+	├── osinit()  // getCPUCount()、getHugePageSize()、osArchInit()、vgetrandomInit()
+    ├── schedinit()     // 初始化调度器、M0, 设置最大m数量10000
+    │   ├── mallocinit()                // 初始化内存分配器
+    │   ├── gcinit()                    // 初始化垃圾回收器
+    │   ├── 初始化 M0剩余的通用字段                     // 主线程，g0 栈
+    │   │   └── mcommoninit(_g_.m)       // 初始化m剩余的通用字段
+    │   │       └── allm = [M0]         // 第一个线程 M0 加入 allm
+    │   └── procresize(GOMAXPROCS)      // 创建 P0~Pn
+    │       ├── allp = [P0, P1, ...]   // 所有逻辑处理器
+    │       └── _g_.m.p = allp[0]      // M0 绑定 P0
+    │
+    ├── newproc(main)                   // 创建 runtime.main 的 G, main goroutine
+    │
+    └── mstart()
+        └── 调度循环 (scheduler loop)
+            └── schedule()                  // 启动调度器，从队列中取出可运行 G 执行
+                ├── findrunnable()          // 从本地队列 / 全局队列 / 偷取队列找可执行 G
+                │   └── g                   // 找到的 Goroutine (runtime.main 对应的 G)
+                └── execute(g)              // 高层执行 goroutine
+                    └── gogo(g)             // 低层上下文切换到 g
+                        └── runtime.main()  // gogo 切换栈后执行 runtime.main
+                            ├── 调用用户的 main.main()
+                            │       └── ... 用户函数执行 ...
+                            │
+                            └── runtime.goexit()   // main goroutine 执行完毕退出
+                                
+                            └── systemstack(newm(sysmon))   // 启动后台监控线程
+                                └── newm()                  // 创建 sysmon M
+                                    └── allm += [M(sysmon)]  // sysmon M 加入 allm
+                                    └── sysmon()
+                                        └── 后台循环监控调度器、GC、网络
+```
+
+
 **GMP模型**：G-goroutine，m-物理线程的封装，p-存储g，绑定到M后g可以被执行，是G眼里的cpu。
 
 **P和M的最大值**：M最大10000，P：GOMAXPROCS限制。二者默认都是GOMAXPROCS
@@ -8,21 +58,93 @@
 
 当异步系统调用完成时，g会被放到某个P的Runnext中执行。同步系统调用返回时，会优先尝试获取m对应的oldP，不行（因为Go 的 sysmon（内部监控线程）发现有这种卡了超过 10 ms 的 M ，那么就会把 P 剥离出来，给到其他的 M 去处理执行，M 数量不够就会新创建。）就去找其他P，如果没有可用，就把g设置为可执行状态放到全局队列中，m则挂起，加入到空闲线程中。
 
+**findRunable流程**:
+1. 每61次从全局队列中取：为了公平性，防止全局队列里的g饿死。
+2. 尝试从本地队列获取：先尝试从runnext上，再尝试本地队列头部取（环形数组）
+3. 尝试从全局队列中获取：从头部取一批放到本地队列后返回一个。一批=min(当前队列的一半, sched.runq.size, sched.runq.size/gomaxprocs+1)
+4. 尝试从netpoll获取
+5. 自旋和worksteal
+	- 当前 M 已自旋，或自旋线程数 < 忙碌 P 的一半，则进入/保持自旋并调用 stealWork
+	- 会尝试4轮streal
+		a. 随机化顺序遍历其他p，降低竞争
+		b. 如果 GC 在等待，则可能有 GC goroutine 可用，直接返回。
+		c. 只在最后一次迭代检查p2定时器：如果有 goroutine 因定时器就绪加入p2本地队列，优先从p2本地队列偷，偷不到就尝试偷runnext(只在最后一次才尝试偷runnext)
+		d. 只从非空闲 P 窃取它的一半，放到本地队列，然后返回第一个
+6. 如果还没有偷到，且在GC 标记阶段，并且有任务要做，就去标记。
+7. 拍快照 allp
+7. 加sched.lock，如果需要GC或runSafePointFn，就释放锁并重新循环等待执行 GC 或安全点任务。
+8. 检查一遍全局队列，有就返回。
+9. 如果m没在自旋，但是需要自旋，就开启自旋，然后释放锁并重新循环。
+10. 分离m和p
+11. （精确的跳舞）此时m没有绑定p。从 spinning → 非 spinning，关键是“先减空转计数，再重新检查全局队列，去偷其他p的，check gc work again， check timer”，保证不会丢失任何 runnable G，同时允许 M 重新成为 spinning 以维持工作保守性。
+12. Poll network until next timer.
+13. m挂起，放回空闲m池。同时支持唤醒后绑定新的 P 继续工作
+
 **主动调度**：
-	- 主动调度
-	- 同步内存访问，加锁等阻塞操作
-	- 正常执行结束角度
+- runtime.Gosched()
+- 同步内存访问，加锁等阻塞操作
+- 系统调用
+- 正常执行结束角度
 
 **抢占式调度**：
-	- 由sysmon（不需要p就能执行）负责，如果检测到某个P的状态为Psyscall（系统调用），并且它已经运行了超过10ms，则会将P的当前的G的stackguard设置为StackPreempt。这个操作其实是相当于加上一个标记，通知这个G在合适时机进行调度。Go会在每个函数入口处比较当前的栈寄存器值和stackguard值来决定是否触发morestack函数。将stackguard设置为StackPreempt作用是进入函数时必定触发morestack，然后在morestack中再引发调度。（但是如果是死循环，不会再次进入函数，就抢占不了了）
-	- 基于信号的抢占（也叫异步抢占）：preemptM()通过runtime.signalM()向制定的m发送sigPreempt信号，m接收到信号执行runtime.sighandler()调用doSigPreempt()确认执行上下文能安全抢占后进行异步抢占。
-	
-	异步抢占的本质是在为垃圾回收器服务。
+- 基于信号的抢占式调度： 
+	1. sysmon（不需要p就能执行）检测到执行过长的 goroutine(10ms)、GC stw时，就会通过`preemptM() -> runtime.signalM()`对它所在的m发出`_SIGUSR1`信号进行抢占。
+		- sysmon会通过`retake()`函数`stackguard0 = StackPreempt`（因为当前goroutine挂起后，可能又立即被唤醒而不是唤醒其他goroutine，该情况由协作式抢占兜底）
+	2. 收到信号后，内核执行`sighandler()`函数，调用`doSigPreempt()`检查处于安全点后，通过`pushCall()`插入`asyncPreempt()`函数调用。
+	3. 回到当前goroutine 执行`asyncPreempt()`函数，通过`mcall`切到`g0`栈执行`gopreempt_m`。
+	4. 将当前goroutine插入到全局可运行队列，M则继续寻找其他goroutine来运行。
+	5. 被抢占的goroutine再此被调度回来时，继续执行流。
 
-	> 1. M1 发送中断信号（signalM(mp, sigPreempt)）
-	> 2. M2 收到信号，操作系统中断其执行代码，并切换到信号处理函数（sighandler(signum, info, ctxt, gp)）
-	> 3. M2 修改执行的上下文，并恢复到修改后的位置（asyncPreempt）
-	> 4. 重新进入调度循环进而调度其他 Goroutine（preemptPark 和 gopreempt_m)
+- 基于协作的抢占式调度：Go会在每个函数的入口处、for 等无调用的长循环中等位置插入检测代码，比较当前的栈寄存器值和stackguard0值来决定是否触发`morestack`函数。设置了`stackguard0 = StackPreempt`作用时进入函数时必定触发`morestack`函数，然后在`morestack`中检测preempt标识触发调度。
+
+**三个设置 stackguard0 = stackPreempt 的地方：**
+- suspendG() (src/runtime/preempt.go:207)
+	- 用途：GC 或调试器需要完全暂停 goroutine
+	- 结果：goroutine 进入 _Gwaiting 状态
+- retake() (src/runtime/proc.go:6497)
+	- 用途：sysmon 定期检查，实现时间片调度
+	- 结果：goroutine 进入 _Grunnable 状态，让出CPU
+- mayMoreStackPreempt() (src/runtime/debug.go:217)
+	- 用途：测试和调试，强制在每个点进行抢占
+	- 结果：下一次栈检查时触发抢占
+```
+时间轴 / CPU 执行流程：
+
+Goroutine 状态:        G1                               G2
+─────────────────────────────────────────────────────────────
+正常运行           ┌───────────────┐
+                   │ 运行中       │
+stackguard0        │ stackGuard   │
+───────────────────┴───────────────┘
+
+**调度器异步抢占**    ┌─────────────────────────────┐
+signal 打断 G1      │ preemptM / asyncPreempt     │
+                   │ isAsyncSafePoint? → true   │
+stackguard0          stackPreempt 设置          │
+───────────────────┴─────────────────────────────┘
+
+G1 状态挂起        ┌───────────────┐
+                   │ _Gscan / suspended │  <- CPU 上还未切换到 G2
+stackguard0        │ stackPreempt    │
+───────────────────┴───────────────┘
+
+G1 恢复运行        ┌───────────────┐
+                   │ 继续执行       │
+stackguard0        │ stackPreempt  │ <- 下一次栈检查触发协作抢占
+───────────────────┴───────────────┘
+
+**协作抢占触发**      ───────────────┐
+                   │ morestack() / │
+                   │ suspendG()    │ <- 保证抢占可靠
+───────────────────┴───────────────┘
+
+调度器切换 G2      ┌───────────────┐
+                   │ G2 开始执行    │
+───────────────────┴───────────────┘
+
+
+```
+
 
 **sysmon的作用**：
 - 释放闲置超过5分钟的span物理内存
@@ -37,15 +159,42 @@
 3. 系统调用
 4. 同步内存访问
 5. 手动调用runtime.Gosched()
+6. sysmon
 
+### m的自旋
+自旋 M 的数量被限制：不超过忙碌 P 数的一半
 
-** m的自旋
+#### 什么时候m会自旋
+- findRunnable 判定需要自旋
+	- 条件：已经在自旋，或“自旋线程数不超过忙碌 P 数的一半”
+- 有新工作提交时 wakep 启动“自旋 M”
+	- 出现可运行工作，且“有空闲 P 且当前没有自旋线程”
+	- wakep() 把 nmspinning 从 0 变 1，并用该 P 启动一个标记为自旋的 M
+- handoffp 在没有自旋/空闲线程时拉起“自旋 M”
+
+补充：同步原语的“自旋”
+- sync.Mutex 等也会“短暂活跃自旋”（使用 procyield），但这是 G 级别的协作自旋，与上面的“调度器自旋 M”不同；其条件更保守（多核、GOMAXPROCS>1、本地 runq 空等）。
+#### 有哪些类型
 为了避免频繁地挂起和恢复M。分为两种自旋，二者之和不超过GOMAXPROCS
 1. 有关联P的M，自旋寻找可执行的G
 2. 无关联P的M，自旋寻找可用的P
 
 当第二种自旋M存在时，第一种自旋的M不会被挂起。
 
+### m0和g0是啥
+m0 是 Go用汇编创建的第一个系统线程，再mcommoninit()中初始化，一个 Go 进程只有一个 m0，也叫主线程。
+
+对应的实例会在全局变量runtime.m0 中，不需要在heap 上分配，M0 负责执行初始化操作和启动第一个G
+### g0
+|         | m0.g0                   | 普通 M.g0            |
+| --------- | ----------------------- | ------------------ |
+| 创建方式      | 静态全局变量                  | `malg()` 动态分配      |
+| 位置        | 编译时 `.data` 段           | 堆内存（mallocgc）      |
+| 绑定关系      | m0.g0 固定绑定              | 每创建一个 M，就创建一个 g0   |
+| 作用        | 启动 runtime / 调度初始化都是在m0.g0的栈上执行 | 在调度、syscall、栈扩容中切换 |
+| 生命周期      | 程序全程存在                  | M 结束时释放            |
+| 是否参与调度    | 否                       | 否（所有 g0 都不被调度器调度）  |
+| 是否可执行用户代码 | 否                       | 否                  |
 
 
 **Reference:**
@@ -62,16 +211,16 @@
 
 ## 内存分配
 [内存布局](https://excalidraw.com/#json=3l_PLDvVUx_aEz-oDaqSX,jvs-dvfWcYFbdIp7dApdhg)
-
+![内存布局](../assets/go_memory.png)
 ### 堆内存分配逻辑
 - 微对象 <16bytes 且不含指针: tiny allocator, mcache
 - 小对象 16bytes-32kb || 含指针: span allocator， mcache
 	- 根据申请的size向上取整到对应的size class对应的span。
-	- 如果mspan中没有足够的空间，则mcache向mcentral申请新的对应span（优先从对应span的NonEmptyList(Partial Set)中分配，NonEmptyList不足则从EmptyList(Full Set)中分配），剩余的补充到mcache自己对应的mspan中
+	- 如果mspan中没有足够的空间，则mcache向mcentral（有136个，每个spanclass各一个，对应68个size class）申请新的对应span（优先从对应span的Partial SpanSet（有空闲）中分配，Full SpanSet中分配），剩余的补充到mcache自己对应的mspan中
 	- 如果mcentral没有足够的内存，则向mheap申请新的span
 	- 如果mheap没有足够的内存，则向操作系统申请新的内存
-	```
-	          ┌───────────────┐
+```
+	      ┌───────────────┐
           │    MCentral   │
           └───────────────┘
                 │
@@ -85,20 +234,27 @@ partial[swept]         full[swept]
 partial[unswept]
 （等待 sweep）
 
-	```
+type mcentral struct {
+    partial [2]spanSet
+    full    [2]spanSet
+}
+
+// 注意 [2] 是因为这两个集合会在 GC 周期间交替使用（一边读，一边写）。
+// 每次 GC 完成一次标记-清扫后：partial 和 full 会互换读写角色
+
+```
 - 大对象 >32kb: mmap, mheap
 ![分配逻辑](../../assets/go_memory_alloc.jpg)
-![分配逻辑](https://qiankunli.github.io/public/upload/go/go_memory_alloc.jpg)
 
 ### 为什么有tiny allocator
 因为mcache中最小的size class=1，对应的内存是8 bytes。如果没有tiny allocator，所有int32，bool，byte等只需要一个字节的类型都会匹配size class=1的bytes空间并独享该空间，造成资源浪费。
 
 ### 内存分配相关
-- goroutine栈默认大小2kb。
+- goroutine栈默认大小2kb，普通线程一般是1M。
 - golang中page是*8k*，linux中page是*4k*。
 	- 如果对象小于 8 KB，每个页可以容纳多个相同大小的对象；如果对象大小正好为 8 KB，则每个页只容纳一个对象。大于 8 KB 的对象会跨越多个页。
 - go进程的栈指的是主线程`m0`的`g0`的栈，也叫做系统栈。
-- 对于小于 512 字节的对象，Go 使用跨度（spans）分配内存，并使用堆位图（heap bitmap）来跟踪跨度中哪些字包含指针
+- 对于小于 512 字节的对象，Go 使用mspan分配内存，并使用堆位图（heap bitmap）来跟踪跨度中哪些字包含指针
 - 对于大于 512 字节的对象，维护一个大的位图效率不高。相反，每个对象都伴随着一个 8 字节的 malloc 头部——一个指向对象类型信息的指针
 - Go 引入了位图摘要的概念，摘要包含三个字段： start 、 end 和 max 。 start 是位图开头连续的 0 比特数。类似地， end 是位图末尾连续的 0 比特数。最后， max 代表最大的连续 0 比特序列。摘要会在位图被修改时立即更新，即当页被分配或释放时。
 - 通过合并低层级摘要，Go 隐式地构建了一个分层结构，从而能够高效地跟踪连续的空闲页。它使用一个**全局的摘要基数树**来管理整个虚拟地址空间。
@@ -130,7 +286,26 @@ partial[unswept]
 	- 当一个time.Timer值不再被使用，一段时间后它将被自动垃圾回收掉。 但对于一个不再使用的time.Ticker值，我们必须调用它的Stop方法结束它，否则它将永远不会得到回收
 5. 不正确地使用终结器（finalizer）而造成的永久性内存泄露（可以不用记）
 6. 延迟调用函数导致的临时性内存泄露
+```go
+func readData() {
+    data := make([]byte, 50<<20) // 50MB
+    defer fmt.Println("done", len(data))
 
+    // 模拟长时间执行的任务
+    for i := 0; i < 1e8; i++ {
+        _ = i * 2
+    }
+}
+
+// 实际发生的事情：
+// 1. data 被分配了 50MB；
+// 2. defer fmt.Println 把 data 的引用捕获；
+// 3. 即使循环不再使用 data；
+// 4. data 在整个函数期间都不能释放；
+// 5. 导致内存长时间保持 50MB 的占用。
+
+// ✅ 它不是“真正泄露”，而是“被 defer 暂时延迟释放”。
+```
 **Reference：**
 - [go堆内存分配](https://qiankunli.github.io/2020/11/22/go_mm.html)
 - [详解Go中内存分配源码实现](https://www.luozhiyun.com/archives/434)
@@ -163,6 +338,12 @@ partial[unswept]
 - *漏标*：a, b, c。a为黑色，b为灰色，c为白色，初始时：b->c。改成a->c, 断开b和c。由于a已经标记为黑色不会再遍历，b也不指向c了，所以c遍历不到，但因为是白色，所以会被清除。不能接受的场景。
 
 所以引入了屏障技术来解决。
+
+### GoRoots
+- 全局变量
+- 执行栈
+- 寄存器
+
 ### 强弱三色不变性：
 - **强三色不变性**：白色对象不能被黑色对象直接引用。插入写屏障（Dijkstra）的目标是实现强三色不变式，保证当一个黑色对象指向一个白色对象前，会先触发屏障将白色对象置为灰色，再建立引用.
 - **弱三色不变形**：白色对象可以被黑色对象引用，但要从某个灰对象出发仍然可达该白对象。删除写屏障（Yuasa barrier）的目标是实现弱三色不变式，保证当一个白色对象即将被上游删除引用前，会触发屏障将其置灰，之后再删除上游指向其的引用.
@@ -196,10 +377,19 @@ writePointer(slot, ptr)
 >
 > 对正在被覆盖的对象进行着色，且如果当前栈未扫描完成， 则同样对指针进行着色。
 ```go
+// 论文中
 writePointer(slot, ptr):
     shade(*slot)
     if current stack is grey:
         shade(ptr)
+    *slot = ptr 
+
+// golang实际
+writePointer(slot, ptr):
+	// 旧值 置灰
+    shade(*slot)
+	// 新值 置灰
+    shade(ptr)
     *slot = ptr
 ```
 
@@ -295,7 +485,7 @@ mutexWaiterShift = iota
 
 **slow path：**
 互斥锁（Mutex）有两种运行模式：*正常模式*和*饥饿模式*。
-在*正常模式*下，等待者会按 FIFO（先进先出）顺序排队，
+- 在*正常模式*下，等待者会按 FIFO（先进先出）顺序排队，
 但被唤醒的等待者并不会直接获得互斥锁，而是要和新到达的
 Goroutine 一起竞争锁的所有权。新来的 Goroutine 有优势，
 因为它们已经在 CPU 上运行，并且可能数量很多，
@@ -303,12 +493,12 @@ Goroutine 一起竞争锁的所有权。新来的 Goroutine 有优势，
 它会被重新放到等待队列的前端。如果一个等待者超过 1ms
 都没能成功获取互斥锁，那么互斥锁会切换到饥饿模式。
 
-在*饥饿模式*下，互斥锁的所有权会直接从解锁的 Goroutine
+- 在*饥饿模式*下，互斥锁的所有权会直接从解锁的 Goroutine
 转交给等待队列头部的 Goroutine。新到达的 Goroutine
 即使看到互斥锁是未加锁状态，也不会去尝试获取，
 也不会自旋，而是直接排到等待队列的尾部。
 
-如果某个等待者获得了互斥锁，并且它发现：它是**队列中最后一个等待者**，或者**它的等待时间少于 1ms**那么互斥锁会切换回*正常模式*。
+**切回正常模式**：如果某个等待者获得了互斥锁，并且它发现：它是**队列中最后一个等待者**，或者**它的实际等待时间少于 1ms**那么互斥锁会切换回*正常模式*。
 
 正常模式的性能要好得多，因为 Goroutine 可以连续多次
 获得互斥锁，即使此时还有其他等待者。
@@ -319,15 +509,15 @@ PS: 饥饿模式是为了公平，避免 goroutine 长时间获取不到锁
 
 工作模式：Mutex 有两种工作模式：
 
-1. 正常模式 （Normal Mode）：
+- 正常模式 （Normal Mode）：
 	1. 当一个 goroutine 请求锁时，如果锁未被持有，它会立即获得锁。
-	2.如果锁已被持有，它会通过几次*自旋（Spinning）*尝试获取锁。自旋是指在不挂起 goroutine 的情况下，进行忙等待循环。这对于锁很快会被释放的场景能提升性能。
-	3.如果自旋后仍未获取到锁，goroutine 会被加入等待队列并挂起。
+	2. 如果锁已被持有，它会通过4次**自旋**尝试获取锁。自旋是指在不挂起 goroutine 的情况下，进行忙等待循环。这对于锁很快会被释放的场景能提升性能。
+	3. 如果自旋后仍未获取到锁，goroutine 会被加入等待队列并挂起。
 	4. 当锁被释放时，会唤醒等待队列中的一个 goroutine。被唤醒的goroutine 和新来的goroutine 会公平竞争。
-2. 饥饿模式（Starving Mode）：
-	1. 如果一个 goroutine 等待锁的时间超过了 1ms，`Mutex` 会切换囚到饥饿模式。
+- 饥饿模式（Starving Mode）：
+	1. 如果一个 goroutine 等待锁的时间超过了 1ms，`Mutex` 会切换到饥饿模式。
 	2. 在饥饿模式下，锁的所有权会直接交接给等待队列中的队头 goroutine，新来的goroutine 即使自旋也无法获取锁。
-	3.目的：防止等待队列中的 aoroutine 因为不断有新来的“插队者”而长时间“饿死”保证了公平性。
+	3. 目的：防止等待队列中的 goroutine 因为不断有新来的“插队者”而长时间“饿死”保证了公平性。
 ### 指令重排
 为了提高cpu指令吞吐
 
@@ -353,7 +543,6 @@ Happens-before (HB) 是并发编程里的一个核心概念，用来描述 操�
 - Channel 发送接收
 - WaitGroup / Cond
 - 原子操作 (atomic)
-- sadl
 
 #### cas
 CAS 是一种 原子操作，用于多线程/多 goroutine 下安全地修改共享变量。底层是CPU 提供的原子指令`lock`。
@@ -389,7 +578,7 @@ CAS 是一种 原子操作，用于多线程/多 goroutine 下安全地修改共
 ### go1.18之前
 1. 如果期望容量大于旧的容量的两倍，直接用期望容量
 2. 如果旧容量小于1024，直接翻倍
-3. 否则，每次增长1.25倍，知道足够。
+3. 否则，每次增长1.25倍，直到足够。
 ```go
 func growslice(et *_type, old slice, cap int) slice {
     ...
@@ -421,7 +610,7 @@ func growslice(et *_type, old slice, cap int) slice {
 
 ### go1.18之后
 1. `newLen`>`2*oldCap`，返回`newLen`
-2. `oldCap`>threshold=256，返回 `2 * oldCap`
+2. `oldCap`< threshold=256，返回 `2 * oldCap`
 3. 在当前`cap`基础上循环累加`(cap + 3*256)>>2`，直到满足`newLen`。更加平滑了。
 ```go
 func growslice(oldPtr unsafe.Pointer, newLen, oldCap, num int, et *_type) slice {
@@ -640,9 +829,9 @@ done:
 - 负载因子：6.5
 - 溢出桶太多
    - 如果 B 特别大，溢出桶阈值也会非常大，这里把 B 限制到最大 15。
-    - 加倍扩容。一个桶的元素会放到两个新桶里。
+   		- 加倍扩容。一个桶的元素会放到两个新桶里。
    - 如果溢出桶数 >= 主桶数，就算“太多”
-    - 等量扩容。把存储稀疏的kv，更集中的存放
+    	- 等量扩容。把存储稀疏的kv，更集中的存放
 5. 如果找到应该存的桶和对应的溢出桶都满了，就创建新的桶
 6. 插入元素。
 7. h.flags &^= hashWriting，位清除。
@@ -778,7 +967,7 @@ func evacuate(t *maptype, h *hmap, oldbucket uintptr) {
 ```
 **map中解决hash冲突（tophash冲突，不是key冲突）的方法**：优先用开放地址法，如果应该放的桶里没有空余的槽，才会链地址法。
 
-**新旧数据迁移在什么时候**：渐进式迁移，在访问、赋值、删除时。
+**新旧数据迁移在什么时候**：渐进式迁移，在赋值mapassign、删除mapdelete时。
 ### go1.24之后
 
 **什么是SIMD**：（Single Instruction Multiple Data）单指令流多数据流。是一种并行计算技术，可以同时对多个数据执行相同的操作。使用 SIMD 的主要目的是为了提升计算性能。
@@ -805,8 +994,8 @@ func evacuate(t *maptype, h *hmap, oldbucket uintptr) {
 	- 向关闭的 chan 发送数据也会 panic
 	- 关闭一个nil的channel
 - 阻塞场景：
-	- send to nil channel
-	- read from nil channel
+	- send to 无缓冲 channel，但是没有接收者
+	- read from 无缓冲 channel，但是没有发送者
 	- 接收时，buffer为空且 sendq 为空
 	- 发送时，buffer满了且 recvq 为空
 
@@ -1386,7 +1575,41 @@ func closechan(c *hchan) {
 ## Context
 Go的Context主要解决三个核心问题：**超时控制**、**取消信号传播**和**请求级数据传递**
 
+```go
+type Context interface {
+    Deadline() (time.Time, bool)
+    Done() <-chan struct{}
+    Err() error
+    Value(key any) any
+}
+```
+### 构造与派生
+- 根上下文
+	- context.Background()：用于生产代码中作为根
+	- context.TODO()：占位符，暂未决定用法时使用
+- 派生
+	- WithCancel(parent)：可手动取消
+	- WithTimeout(parent, d)：超时自动取消
+	- WithDeadline(parent, t)：到时自动取消
+	- WithValue(parent, key, val)：附带请求范围值（慎用）
+### 传播与协作取消
+树形结构：子 Context 链接父 Context；父被取消/超时，会级联关闭所有子 Context 的 Done。
+协作要求：被调用方需要遵守语义，定期检查 ctx.Done()/ctx.Err() 并尽早返回
 
+### context的应用场景
+- 取消信号传递
+- 超时控制（相对时间）
+- 截止时间（绝对时间）
+- 请求范围的值传递
+- 控制并发请求
+### 注意事项
+- 一定记得 cancel：凡是 WithCancel/WithTimeout/WithDeadline，务必在合适位置调用 cancel（通常用 defer），避免资源泄漏
+- ctx 作为第一个参数传递；不要存放在结构体字段里；不要传 nil
+- WithValue 谨慎用：仅传请求范围的小数据；key 用自定义未导出类型，避免冲突；不要用它代替函数参数
+- 不要取消父 Context（只取消自己派生的）；不要把 Context 用作日志器/可变状态容器
+- 值应只读且体积小，避免导致高开销或 GC 压力
+### Referrences:
+[一文读懂Golang中的Context应用场景（含案例）](https://juejin.cn/post/7339924521782853647)
 ## sync
 ### sync.Map
 `read` 和 `dirty` 冗余，实现读写分离。
@@ -1462,7 +1685,7 @@ type Map struct {
 
 1. 先读 read map：
 	- 如果 key 存在直接返回，无需加锁。
-2. 如果 read map 未命中且 amended 为 true：
+2. 如果 read map 未命中且 amended（意思：修正。代表dirty map有新数据） 为 true：
 	- 加锁访问 dirty map。
 	- 在加锁状态下再尝试从 read map 找一次，防止在等待锁期间 dirty map 已经升级。
 	- 如果仍未命中，则从 dirty map 查找，并记录一次 miss。
@@ -1518,9 +1741,12 @@ func (m *Map) missLocked() {
 核心思想：读多写少场景下先尝试无锁写，不行再将写操作安全落到 dirty map。
 
 **store 流程简述：**
-1. 快速路径：先在 read map 查找 key，存在且未删除则尝试无锁更新（CAS）。
+1. 快速路径：先在 read map 查找 key，存在且未删除（value !=expunged）则尝试无锁更新（CAS）。
 2. 慢路径：如果 key 不在 read 或已删除，加锁更新 dirty map。
-3. 新 key：第一次写入新 key 时，初始化 dirty map，并插入 entry。
+3. 新 key：第一次写入新 key 时。
+	a. dirtyLocked(): 如果dirty map为nil，加载read map，并将所有value不等于nil或expunged的加入到dirty map。read map中value=nil的会被标记为value=expunged。
+	b. 更新read map，标记为有新数据（m.read.Store(&readOnly{m: read.m, amended: true})）
+4. 并插入 entry 到dirty。
 ```go
 // Store sets the value for a key.
 func (m *Map) Store(key, value any) {
@@ -1584,7 +1810,7 @@ func (m *Map) Swap(key, value any) (previous any, loaded bool) {
 		if !read.amended {
 			// We're adding the first new key to the dirty map.
 			// Make sure it is allocated and mark the read-only map as incomplete.
-			m.dirtyLocked()
+			m.dirtyLocked() // 会设置 expunged
 			m.read.Store(&readOnly{m: read.m, amended: true})
 		}
 		// 存入 dirty 中
@@ -1593,25 +1819,58 @@ func (m *Map) Swap(key, value any) (previous any, loaded bool) {
 	m.mu.Unlock()
 	return previous, loaded
 }
+
+func (m *Map) dirtyLocked() {
+	if m.dirty != nil {
+		return
+	}
+
+	read := m.loadReadOnly()
+	m.dirty = make(map[any]*entry, len(read.m))
+	for k, e := range read.m {
+		if !e.tryExpungeLocked() {
+			m.dirty[k] = e
+		}
+	}
+}
+
+func (e *entry) tryExpungeLocked() (isExpunged bool) {
+	p := e.p.Load()
+	for p == nil {
+		if e.p.CompareAndSwap(nil, expunged) {
+			return true
+		}
+		p = e.p.Load()
+	}
+	return p == expunged
+}
+
 ```
 
 #### delete
-和 load 的流程基本一致。
+1. 先尝试无锁读取 read map，如果在直接删除
+2. 否则，判断dirty map有更新，加锁
+	a. 再次尝试无锁读取 read map，如果在就不查 dirty map，
+	b. 否则从 dirty map中查，并将misses加一，无论是否找到。
+	c. 解锁
+3. 删除
+	a. 如果已经彻底删除，或者标记删除，啥都不做
+	b. 否则CompareAndSwap清空为nil
 
 既有标记删除，又有原子删除。
-| 特性             | 原子删除（nil）                  | 标记删除（expunged）              |
+| 特性             | （nil）                  | （expunged）              |
 | -------------- | -------------------------- | --------------------------- |
 | 并发安全           | CAS 原子操作                   | CAS 原子操作                    |
-| 意义             | 值被删除，entry 可能还存在           | entry 永久不可用，防止被重用           |
+| 意义             | 对应的key可以直接在read map里更新           | 对应key只能在dirty map中更新
 | 触发时机           | `Delete` 或 `LoadAndDelete` | dirty map 初始化 / 升级 read map |
 | 对 read map 的影响 | 无直接影响                      | 保证 read map 不可变             |
 
-** 标记删除**:
+**标记删除**:
 场景：dirty map 升级、第一次写入到新的 key 或 read→dirty 升级时。
 
 例如有一个 key 原本在 read map 中，但已经被删除（nil），然后 dirty map 初始化时，需要保证这个 entry 不会被误用。
 
-** 原子删除**:
+**原子删除**:
 场景：普通删除操作，例如 Delete 或 LoadAndDelete。 比如`m.Delete("foo")`时。
 
 `delete()`函数流程：
@@ -1707,7 +1966,7 @@ type Pool struct {
 
 ## 常见题
 ### Go语言在什么情况下会发生内存泄漏？
-- **goroutine泄漏：**这是最常见的泄漏场景。goroutine没有正常退出会一直占用内存，比如从channel读取数据但channel永远不会有数据写入，或者死循环没有退出条件。我在项目中遇到过，启动了处理任务的 goroutine但没有合适的退出机制，导致随着请求增加goroutine越来越多。
+- **goroutine泄漏**：这是最常见的泄漏场景。goroutine没有正常退出会一直占用内存，比如从channel读取数据但channel永远不会有数据写入，或者死循环没有退出条件。我在项目中遇到过，启动了处理任务的 goroutine但没有合适的退出机制，导致随着请求增加goroutine越来越多。
 
 - **channel泄漏**：未关闭的channel和等待channel的goroutine会相互持有引用。比如生产者已经结束但没有关闭channel，消费者goroutine会一直阻塞等待，造成内存无法回收。
 
@@ -1718,6 +1977,27 @@ type Pool struct {
 - **定时器未停止**： time.After 或 time.NewTimer 创建的定时器如果不手动停止，会在heap中持续存在。
 
 - **循环引用**：虽然Go的GC能处理循环引用，但在某些复杂场景下仍可能出现问题。
+- **延迟调用函数导致的临时性内存泄露**
+```go
+func readData() {
+    data := make([]byte, 50<<20) // 50MB
+    defer fmt.Println("done", len(data))
+
+    // 模拟长时间执行的任务
+    for i := 0; i < 1e8; i++ {
+        _ = i * 2
+    }
+}
+
+// 实际发生的事情：
+// 1. data 被分配了 50MB；
+// 2. defer fmt.Println 把 data 的引用捕获；
+// 3. 即使循环不再使用 data；
+// 4. data 在整个函数期间都不能释放；
+// 5. 导致内存长时间保持 50MB 的占用。
+
+// ✅ 它不是“真正泄露”，而是“被 defer 暂时延迟释放”。
+```
 ### GC 关注的指标有哪些？
 - CPU 利用率：回收算法会在多大程度上拖慢程序？有时候，这个是通过回收占用的CPU 时间与其它CPU 时间的百分比来描述的。
 - GC停顿时间：回收器会造成多长时间的停顿？目前的 GC 中需要考虑 STW 和 Mark Assist 两个部分可能造成的停顿。

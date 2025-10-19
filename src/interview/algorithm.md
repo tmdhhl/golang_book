@@ -35,6 +35,8 @@
 51. N皇后：https://leetcode.cn/problems/n-queens/submissions/663653021/?envType=study-plan-v2&envId=top-100-liked
 二分查找：6
 153. 寻找旋转排序数组中的最小值: https://leetcode.cn/problems/find-minimum-in-rotated-sorted-array/?envType=study-plan-v2&envId=top-100-liked
+
+根据中点 mid 所在的区间是否有序 来决定左右边界的移动。
 *** 33. 搜索旋转排序数组: https://leetcode.cn/problems/search-in-rotated-sorted-array/description/?envType=study-plan-v2&envId=top-100-liked
 
 栈：5
