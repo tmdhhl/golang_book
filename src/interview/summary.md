@@ -976,7 +976,7 @@ func evacuate(t *maptype, h *hmap, oldbucket uintptr) {
 **新旧数据迁移在什么时候**：渐进式迁移，在赋值mapassign、删除mapdelete时。
 ### go1.24之后
 
-**什么是SIMD**：（Single Instruction Multiple Data）单指令流多数据流。是一种并行计算技术，可以同时对多个数据执行相同的操作。使用 SIMD 的主要目的是为了提升计算性能。
+**什么是SIMD**：（Single Instruction Multiple Data）单指令多数据流。是一种并行计算技术，可以同时对多个数据执行相同的操作。使用 SIMD 的主要目的是为了提升计算性能。
 **Referrence:**
 <!-- 1.24之前 -->
 - [浅谈Golang 1.21.0 map源码](https://zhuanlan.zhihu.com/p/653518993)
