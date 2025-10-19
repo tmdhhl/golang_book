@@ -786,8 +786,8 @@ bucketloop:
     // 桶扩容的条件：命中了最大负载因子或溢出桶太多
     // - 负载因子：6.5
     // - 溢出桶太多
-    //    - 如果 B 特别大，溢出桶阈值也会非常大，这里把 B 限制到最大 15
-    //    - 如果溢出桶数 >= 主桶数，就算“太多”
+	//    - 如果B<15, 当溢出桶为2^B次方时，认为桶太多
+    //    - 如果B>=15, 当溢出桶为2^15次方时，认为桶太多
 	if !h.growing() && (overLoadFactor(h.count+1, h.B) || tooManyOverflowBuckets(h.noverflow, h.B)) {
 		hashGrow(t, h)
 		goto again // Growing the table invalidates everything, so try again
