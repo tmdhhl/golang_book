@@ -2030,6 +2030,7 @@ type Pool struct {
 
 - **循环引用**：虽然Go的GC能处理循环引用，但在某些复杂场景下仍可能出现问题。
 - **延迟调用函数导致的临时性内存泄露**
+```
 ```go
 func readData() {
     data := make([]byte, 50<<20) // 50MB
@@ -2050,6 +2051,85 @@ func readData() {
 
 // ✅ 它不是“真正泄露”，而是“被 defer 暂时延迟释放”。
 ```
+
+
+### 内存逃逸
+变量在栈上还是堆上分配，不是由语法位置决定的，而是由编译器的逃逸分析结果决定的。
+- 如果编译器能确定变量的生命周期不会超过当前函数（即变量只在当前函数内使用），则会：→ 分配在 栈上（stack）。
+- 如果编译器发现变量可能在函数返回后仍被引用，则：→ 分配在 堆上（heap）。
+#### 逃逸分析
+```go
+go build -gcflags="-m" main.go
+
+go run -gcflags="-m" main.go
+#### 逃逸场景
+1. 返回局部变量的指针 → 逃逸
+```go
+func foo() *int {
+    x := 10
+    return &x  // x 逃逸，因为返回了它的指针
+}
+```
+2. 闭包引用外部变量 → 逃逸
+```go
+func bar() func() int {
+    x := 10
+    return func() int {
+        return x // 闭包引用外部变量
+    }
+}
+```
+3. 接口传递导致逃逸
+```go
+func printAny(v interface{}) {
+    fmt.Println(v)
+}
+
+func test() {
+    x := 10
+    printAny(x)
+}
+```
+4. 切片或 map 的内部指针导致逃逸
+```go
+func foo() {
+    s := make([]int, 10000) // cap小了不会逃逸
+    _ = s
+}
+
+// 这种都会逃逸
+func foo() []int {
+    s := make([]int, 1)
+    return s  // 切片底层数组逃逸
+}
+
+```
+5. 大对象可能直接分配到堆上
+
+### 如果一个buffer正在写入，把它close了会怎么样
+- 如果缓冲区已满：
+	- goroutine 会阻塞在 ch <- v 上
+	- 如果另一个 goroutine 执行 close(ch)，runtime 会立即唤醒阻塞的发送者，并触发 panic：send on closed channel
+- 如果缓冲区未满：
+	- 已经在缓冲区的写入可以成功完成
+	- 后续任何新的写入都会 panic
+### goroutine的生命周期，怎么创建和消失
+1. 创建：go func() → newproc → G 分配 → 放入 runqueue
+2. 运行：M 从 P 获取 G 执行 → 遇阻塞挂起 → 被唤醒再执行
+3. 结束：函数返回或 panic → G 状态 dead → 栈和 G 对象回收
+
+PS：goroutine不能直接被`kill`命令kill掉，因为goroutine由runtime负责调度。
+
+### pprof是怎么得到想要的信息的
+Go runtime 提供这些接口，pprof 不会直接扫描内存或打断线程，而是利用 runtime 内部维护的数据结构。
+
+| 类型          | 收集方式      | 数据特点          |
+| ----------- | --------- | ------------- |
+| CPU         | 采样        | 函数出现频率统计，低开销  |
+| Heap        | 每次 malloc | 精确，实时反映分配     |
+| Goroutine   | 实时 dump   | 当前 stack + 状态 |
+| Block/Mutex | 在阻塞/解锁时记录 | 可统计阻塞时间分布     |
+
 ### GC 关注的指标有哪些？
 - CPU 利用率：回收算法会在多大程度上拖慢程序？有时候，这个是通过回收占用的CPU 时间与其它CPU 时间的百分比来描述的。
 - GC停顿时间：回收器会造成多长时间的停顿？目前的 GC 中需要考虑 STW 和 Mark Assist 两个部分可能造成的停顿。
@@ -2062,3 +2142,12 @@ func readData() {
 ## 一些不错的文章/blog
 - https://blog.csdn.net/qq_44805265/category_13054959.html
 - https://www.zhihu.com/people/josefa_zyq/posts
+
+
+
+### Redis
+#### 大key和热key问题
+| 问题    | 影响             | 核心处理方式             |
+| ----- | -------------- | ------------------ |
+| 大 key | 主线程阻塞和主从复制阻塞、内存峰值、迁移慢    | 拆分 key、限制大小、异步删除、合理过期   |
+| 热 key | 1. Redis 是单线程处理，热 key 被频繁访问，可能造成延迟抖动 2. 单个 key 被频繁更新（如计数器） → CPU 消耗大 3. 集群压力不均匀 （Cluster 分片基于 key hash → 热 key 全部落在某个节点 → 节点过载）| 在客户端或应用服务器做二级缓存、热点 Key 分散、限流、多副本读取 |
