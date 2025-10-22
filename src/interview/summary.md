@@ -66,10 +66,10 @@ _rt0_go
 5. 自旋和worksteal
 	- 当前 M 已自旋，或自旋线程数 < 忙碌 P 的一半，则进入/保持自旋并调用 stealWork
 	- 会尝试4轮streal
-		a. 随机化顺序遍历其他p，降低竞争
-		b. 如果 GC 在等待，则可能有 GC goroutine 可用，直接返回。
-		c. 只在最后一次迭代检查p2定时器：如果有 goroutine 因定时器就绪加入p2本地队列，优先从p2本地队列偷，偷不到就尝试偷runnext(只在最后一次才尝试偷runnext)
-		d. 只从非空闲 P 窃取它的一半，放到本地队列，然后返回第一个
+		1. 随机化顺序遍历其他p，降低竞争
+		2. 如果 GC 在等待，则可能有 GC goroutine 可用，直接返回。
+		3. 只在最后一次迭代检查p2定时器：如果有 goroutine 因定时器就绪加入p2本地队列，优先从p2本地队列偷，偷不到就尝试偷runnext(只在最后一次才尝试偷runnext)
+		4. 只从非空闲 P 窃取它的一半，放到本地队列，然后返回第一个
 6. 如果还没有偷到，且在GC 标记阶段，并且有任务要做，就去标记。
 7. 拍快照 allp
 7. 加sched.lock，如果需要GC或runSafePointFn，就释放锁并重新循环等待执行 GC 或安全点任务。
@@ -151,47 +151,9 @@ _rt0_go
 - mayMoreStackPreempt() (src/runtime/debug.go:217)
 	- 用途：测试和调试，强制在每个点进行抢占
 	- 结果：下一次栈检查时触发抢占
-```
-时间轴 / CPU 执行流程：
-
-Goroutine 状态:        G1                               G2
-─────────────────────────────────────────────────────────────
-正常运行           ┌───────────────┐
-                   │ 运行中       │
-stackguard0        │ stackGuard   │
-───────────────────┴───────────────┘
-
-**调度器异步抢占**    ┌─────────────────────────────┐
-signal 打断 G1      │ preemptM / asyncPreempt     │
-                   │ isAsyncSafePoint? → true   │
-stackguard0          stackPreempt 设置          │
-───────────────────┴─────────────────────────────┘
-
-G1 状态挂起        ┌───────────────┐
-                   │ _Gscan / suspended │  <- CPU 上还未切换到 G2
-stackguard0        │ stackPreempt    │
-───────────────────┴───────────────┘
-
-G1 恢复运行        ┌───────────────┐
-                   │ 继续执行       │
-stackguard0        │ stackPreempt  │ <- 下一次栈检查触发协作抢占
-───────────────────┴───────────────┘
-
-**协作抢占触发**      ───────────────┐
-                   │ morestack() / │
-                   │ suspendG()    │ <- 保证抢占可靠
-───────────────────┴───────────────┘
-
-调度器切换 G2      ┌───────────────┐
-                   │ G2 开始执行    │
-───────────────────┴───────────────┘
-
-
-```
-
 
 **sysmon的作用**：
-- 释放闲置超过5分钟的span物理内存（好像不太准确scavenger）
+- 释放闲置超过5分钟的span物理内存（go1.12之前是的，现在不太准确scavenger函数）
 - 如果超过2分钟没有执行垃圾回收，强制执行
 - 将长时间未处理(10ms)的netpoll结果添加到任务队列: poll network if not polled for more than 10ms
 - 向长时间(10ms)运行的G发出抢占调度
@@ -254,6 +216,16 @@ m0 是 Go用汇编创建的第一个系统线程，再mcommoninit()中初始化�
 - [Go 语言设计与实现](https://draven.co/golang/docs/part3-runtime/ch06-concurrency/golang-goroutine/)
 
 ## 内存分配
+`mspan`: Go中内存管理的基本单元
+
+`mcache`：每个工作线程都会绑定一个mcache，本地缓存可用的mspan资源。
+
+`mcentral`：为所有 mcache提供切分好的 mspan资源。需要加锁
+
+`mheap`：代表Go程序持有的所有堆空间，Go程序使用一个mheap的全局对象_mheap来管理堆内存。mheap上的span也已经切分好大小了。·
+
+
+
 [内存布局](https://excalidraw.com/#json=3l_PLDvVUx_aEz-oDaqSX,jvs-dvfWcYFbdIp7dApdhg)
 ![内存布局](../assets/go_memory.png)
 ### 堆内存分配逻辑
