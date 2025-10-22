@@ -88,15 +88,59 @@ _rt0_go
 
 **抢占式调度**：
 - 基于信号的抢占式调度： 
-	1. sysmon（不需要p就能执行）检测到执行过长的 goroutine(10ms)、GC stw时，就会通过`preemptM() -> runtime.signalM()`对它所在的m发出`_SIGUSR1`信号进行抢占。
-		- sysmon会通过`retake()`函数`stackguard0 = StackPreempt`（因为当前goroutine挂起后，可能又立即被唤醒而不是唤醒其他goroutine，该情况由协作式抢占兜底）
-	2. 收到信号后，内核执行`sighandler()`函数，调用`doSigPreempt()`检查处于安全点后，通过`pushCall()`插入`asyncPreempt()`函数调用。
-	3. 回到当前goroutine 执行`asyncPreempt()`函数，通过`mcall`切到`g0`栈执行`gopreempt_m`。
+	1. sysmon（不需要p就能执行）检测到执行过长的 goroutine(10ms)、GC stw时，就会通过`retake()-> preemptone() -> preemptM() -> runtime.signalM()`对它所在的m发出`_SIGURG`信号进行抢占。
+		- suspendG() (src/runtime/preempt.go:207) 也会调用`preemptM()`发送异步抢占。suspendG 同时走“同步抢占 + 异步信号”两条路，是为了把正在跑的目标 goroutine 以最小延迟推进到安全点；仅靠同步抢占要等下一个函数序言或回边，延迟不可控，而异步信号可在“异步安全点”直接插入 preempt 调用，显著降时
+		- sysmon会通过`retake()`函数调用`preemptone()`函数将`stackguard0 = StackPreempt`。
+			- PS：为了标记一下已经抢占了，避免栈增长检查时再次进行抢占。
+				```go
+				func suspendG(gp *g) suspendGState {
+					...
+					case _Grunning:
+						// Optimization: if there is already a pending preemption request
+						// (from the previous loop iteration), don't bother with the atomics.
+						if gp.preemptStop && gp.preempt && gp.stackguard0 == stackPreempt && asyncM == gp.m && asyncM.preemptGen.Load() == asyncGen {
+							break
+						}
+				}
+				```
+			- 所以异步抢占和同步抢占是两条路，异步里设置`stackguard0 = StackPreempt`就是为了防止同步里再设置。
+		- 每次函数调用时，Go 都会检查栈是否溢出，通过比较当前栈指针（SP）与 gp->stackguard0 来实现
+	2. 收到信号后，内核执行`sighandler()`函数，调用`doSigPreempt()`检查*g是否想被抢占且处于安全点*后，通过`pushCall()`插入`asyncPreempt()`函数调用。
+		- asyncPreempt() saves all user registers and calls asyncPreempt2
+		- asyncPreempt()对应的是汇编代码
+	3. 回到当前goroutine 执行`asyncPreempt2()`函数，通过`mcall`切到`g0`栈执行`gopreempt_m`。
+		- `mcall` switches from the g to the g0 stack and invokes fn(g),
+		```go
+		func asyncPreempt2() {
+			gp := getg()
+			gp.asyncSafePoint = true
+			if gp.preemptStop {
+				mcall(preemptPark)
+			} else {
+				mcall(gopreempt_m)
+			}
+			gp.asyncSafePoint = false
+		}
+		```
 	4. 将当前goroutine插入到全局可运行队列，M则继续寻找其他goroutine来运行。
-	5. 被抢占的goroutine再此被调度回来时，继续执行流。
+		```go
+		func gopreempt_m(gp *g) {
+			goschedImpl(gp, true)
+		}
+
+		func goschedImpl(gp *g, preempted bool) {
+			...
+			dropg()
+			lock(&sched.lock)
+			globrunqput(gp) // 放入全局队列
+			unlock(&sched.lock)
+			...
+		}
+		```
+	5. 被抢占的goroutine再此被调度回来时(在`execute()`函数里把gp.stackguard0 = gp.stack.lo + stackGuard)，继续执行流。
 
 - 基于协作的抢占式调度：Go会在每个函数的入口处、for 等无调用的长循环中等位置插入检测代码，比较当前的栈寄存器值和stackguard0值来决定是否触发`morestack`函数。设置了`stackguard0 = StackPreempt`作用时进入函数时必定触发`morestack`函数，然后在`morestack`中检测preempt标识触发调度。
-
+	- suspendG 通过把 gp.stackguard0 设为 stackPreempt，强制下一次函数序言走 morestack/newstack；而 newstack 识别到这是“同步抢占”后，不做栈扩展而直接进入调度（park 或让出），因此 morestack 是 suspendG 实施“同步抢占”的执行入口；异步信号只是“加速器”。
 **三个设置 stackguard0 = stackPreempt 的地方：**
 - suspendG() (src/runtime/preempt.go:207)
 	- 用途：GC 或调试器需要完全暂停 goroutine
@@ -147,11 +191,11 @@ stackguard0        │ stackPreempt  │ <- 下一次栈检查触发协作抢占
 
 
 **sysmon的作用**：
-- 释放闲置超过5分钟的span物理内存
+- 释放闲置超过5分钟的span物理内存（好像不太准确scavenger）
 - 如果超过2分钟没有执行垃圾回收，强制执行
-- 将长时间未处理的netpoll结果添加到任务队列
+- 将长时间未处理(10ms)的netpoll结果添加到任务队列: poll network if not polled for more than 10ms
 - 向长时间(10ms)运行的G发出抢占调度
-- 收回因同步syscall长时间阻塞的P
+- 收回因同步syscall长时间阻塞（20us）的P
 
 **GO调度的时机**
 1. 使用关键字go
